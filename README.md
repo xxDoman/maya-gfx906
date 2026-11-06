@@ -73,6 +73,20 @@ limit is free; on the host it needs `sudo prlimit --memlock=unlimited:unlimited 
 edits survive container restarts and image updates. Models are mounted at `/models`; the pack's shard
 symlinks are relative for exactly that reason.
 
+## The config is upstream's, not ours
+
+Nothing here re-documents the settings — the server, the config format and every key are upstream's:
+
+- **`docs/MANUAL.md`** — "Configure and start", "Using it", options:
+  https://github.com/zephel01/Abyss/blob/c56e6d1/docs/MANUAL.md
+- **`docs/SETTINGS.md`** — every key in the JSON, what it does, defaults:
+  https://github.com/zephel01/Abyss/blob/c56e6d1/docs/SETTINGS.md
+
+Our `maya/config/strata-dsv4.json` is that same file with three paths swapped: `exe` →
+`/opt/strata/engine/strata`, the pack under `/models`, and `log` under `/data`. Everything else —
+`--max-context`, `--prefill`, `sampling`, `env`, `model_name` — behaves as described there, and the
+engine's own flags are the ones `strata --help` prints.
+
 ## Using it
 
 The container starts the same server the host command starts — `serve/server.py --engine strata` — so
