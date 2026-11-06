@@ -111,3 +111,11 @@ docker build -f Dockerfile.maya -t xxdoman/maya-gfx906:0.1 .
 The engine is compiled inside the image from upstream source plus the patch. A binary built on the host
 does not travel: Ubuntu 26.04 links against glibc 2.43, and the ROCm 24.04 base image has 2.39 —
 `/app/strata: version 'GLIBC_2.43' not found` at exec.
+
+**This Dockerfile is not self-contained, on purpose.** It builds `FROM xxdoman/strata-mi50:0.2.9`, and
+that base is the part which cannot be recreated from a stock ROCm image: official ROCm ships rocBLAS
+kernels only from `gfx1010`, so on `gfx906` there is no GEMM code at all until the host's gfx906
+rocBLAS libraries and the tuned solution table are packed in. Pull the base from the Hub, or build it
+from https://github.com/xxDoman/strata-gfx906 first — without it this Dockerfile has nothing to stand
+on. Everyone else should simply `docker pull xxdoman/maya-gfx906:0.1`; the Dockerfile is here so the
+image can be audited and rebuilt by us, not as a generic recipe.
