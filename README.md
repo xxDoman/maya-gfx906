@@ -1,8 +1,10 @@
 # Maya + Strata on gfx906: DeepSeek-V4-Flash-0731 at 13.3 tok/s on one MI50
 
-As far as we know this is the only public `gfx906` (MI50 / MI60 / Radeon VII) build that runs
-DeepSeek-V4-Flash-0731 at all — llama.cpp gets it to 3.75 tok/s, nothing else publishes a working
-image. If you know of another, open an issue and it will be listed here.
+**Prior art on gfx906:** [mixa3607/ML-gfx906](https://github.com/mixa3607/ML-gfx906) (376 stars) builds
+llama.cpp, ComfyUI, PyTorch, Strata *and* Maya for these cards, and publishes them as
+`mixa3607/maya-gfx906` / `mixa3607/strata-gfx906`. Those are stock upstream builds; the deepseek4 pack
+fixes below are not in that tree, which is what this image adds. Tested against their Maya image — see
+"What was compared" at the bottom.
 
 **Image:** `xxdoman/maya-gfx906:0.1` (alias `:latest`, digest
 `sha256:245c0d79b4bfa3ee7568398b5944aff545651c8a148ead2c8df01864d112113d`, 7.79 GB) — the upstream Maya
