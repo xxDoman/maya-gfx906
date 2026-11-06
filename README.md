@@ -73,6 +73,60 @@ limit is free; on the host it needs `sudo prlimit --memlock=unlimited:unlimited 
 edits survive container restarts and image updates. Models are mounted at `/models`; the pack's shard
 symlinks are relative for exactly that reason.
 
+## Using it
+
+The container starts the same server the host command starts — `serve/server.py --engine strata` — so
+everything in the upstream `docs/MANUAL.md` applies, only the paths differ.
+
+**Is it up?**
+
+```sh
+docker ps --filter name=maya
+curl -s localhost:8092/health          # {"status": "ok", ...}
+docker logs -f maya                   # the engine's own log
+```
+
+A start takes about a minute: the dense weights go to the GPU, then every expert is read into the VRAM
+and RAM tiers (~20 s at 4 GB/s from an NVMe). The last line the entrypoint prints before that is
+`[maya] dashboard na :8092`; the engine announces `RAM tier 31.98 GB pinned, 4508 slots` when the tier
+is up.
+
+**Browser:** `http://<host>:8092/` — chat, the live expert-tier/GPU monitor, settings.
+
+**OpenAI-compatible API:** base URL `http://<host>:8092/v1`, any model name.
+
+```sh
+curl http://localhost:8092/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "What is 17*23?"}]}'
+```
+
+**Anthropic-compatible:** `POST /v1/messages` on the same port. Also `/v1/models`, `/v1/status`,
+`/metrics`, `/slots`, `/status`.
+
+**Changing the config** (context, RAM tier, sampling, log path):
+
+```sh
+docker exec -it maya sh -c 'vi /data/maya/strata-dsv4.json'   # or edit the file in the maya-data volume
+docker restart maya
+```
+
+`STRATA_GLM_RAM_GB` can also be set on `docker run -e`, and the entrypoint passes it to the engine;
+`--max-context` and the model paths live in the JSON.
+
+**Exposing it beyond localhost.** The entrypoint binds `0.0.0.0` so the dashboard is reachable from the
+LAN, and by default the API has **no key**. Either publish it on the loopback interface only —
+`-p 127.0.0.1:8092:8092` — or set one:
+
+```sh
+docker run ... -e STRATA_API_KEY=secret -p 8092:8092 ...
+```
+
+The server reads `STRATA_API_KEY` itself (`--api-key`), so clients then send
+`Authorization: Bearer secret`.
+
+**Stopping:** `docker stop maya` (the server is PID 1 and shuts down cleanly). `docker rm maya` keeps
+the config, because it lives in the `maya-data` volume.
+
 ## What does not work
 
 - **No MTP / speculative decoding.** The original weights have one MTP layer
