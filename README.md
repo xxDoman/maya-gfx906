@@ -1,10 +1,18 @@
 # Maya + Strata on gfx906: DeepSeek-V4-Flash-0731 at 13.3 tok/s on one MI50
 
-**Prior art on gfx906:** [mixa3607/ML-gfx906](https://github.com/mixa3607/ML-gfx906) (376 stars) builds
-llama.cpp, ComfyUI, PyTorch, Strata *and* Maya for these cards, and publishes them as
-`mixa3607/maya-gfx906` / `mixa3607/strata-gfx906`. Those are stock upstream builds; the deepseek4 pack
-fixes below are not in that tree, which is what this image adds. Tested against their Maya image — see
-"What was compared" at the bottom.
+**This niche is not empty — check the neighbours first.**
+
+- [mixa3607/ML-gfx906](https://github.com/mixa3607/ML-gfx906) (376 stars) publishes gfx906 builds of
+  llama.cpp, ComfyUI, PyTorch, Strata and [Project Maya](https://github.com/mw00/project-maya) as
+  `mixa3607/maya-gfx906` / `mixa3607/strata-gfx906`. That Maya is a different project with its own
+  engines (`maya`, `maya-ds4`), `pack_gguf.py` packs, multi-GPU tensor parallel and vision — its
+  `RUNNING.md` documents DeepSeek-V4.1-Flash-1017 on 4× MI50 with a 192 GB RAM budget. If you are aiming
+  at 1017 with several cards, start there, not here.
+- `mxxm/llama-cpp-gfx906` — plain llama.cpp for these cards, 205k pulls. It runs this model too, at
+  3.75 tok/s (measured below).
+
+What this image adds is narrower and specific: the Strata engine's **deepseek4 pack path fixed for the
+0731 UD-IQ2_XXS pack**, sized for one card.
 
 **Image:** `xxdoman/maya-gfx906:0.1` (alias `:latest`, digest
 `sha256:245c0d79b4bfa3ee7568398b5944aff545651c8a148ead2c8df01864d112113d`, 7.79 GB) — the upstream Maya
