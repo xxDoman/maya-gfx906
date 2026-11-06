@@ -1,8 +1,14 @@
 # Maya + Strata on gfx906: DeepSeek-V4-Flash-0731 at 13.3 tok/s on one MI50
 
-**Image:** `xxdoman/maya-gfx906:0.1` — the upstream Maya dashboard (`serve/server.py`, unmodified) on top of
-the Strata engine built for `gfx906`, with the pack-path fixes below. Same layout as
-`xxdoman/strata-mi50`: `/opt/strata/engine/strata`, Maya in `/opt/maya`, volumes `/models` `/data` `/work`.
+**Image:** `xxdoman/maya-gfx906:0.1` (alias `:latest`, digest
+`sha256:245c0d79b4bfa3ee7568398b5944aff545651c8a148ead2c8df01864d112113d`, 7.79 GB) — the upstream Maya
+dashboard (`serve/server.py`, unmodified) on top of the Strata engine built for `gfx906`, with the
+pack-path fixes below. Same layout as `xxdoman/strata-mi50`: `/opt/strata/engine/strata`, Maya in
+`/opt/maya`, volumes `/models` `/data` `/work`.
+
+```
+docker pull xxdoman/maya-gfx906:0.1
+```
 
 **Host measured on:** LianLi — 1× MI50 32 GB (`gfx906`), 61 GB DDR4, i5-12400F, NVMe, ROCm 7.2.1,
 `power1_cap` 225 W (default, nothing limited), 8192-token context.
