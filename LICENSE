@@ -2,9 +2,13 @@ MIT License
 
 Copyright (c) 2026 xxDoman
 
-The Strata engine this image packages is MIT-licensed work by its authors
-(https://github.com/zephel01/Abyss); the copyright notice travels with it in
-/opt/strata/LICENSE inside the image.
+The Strata engine this image packages is MIT-licensed work:
+"Copyright (c) 2026 Niko1221 and the Strata contributors"
+(https://github.com/Niko1221/Strata). Its notice and the bundled
+third_party/llama.cpp notice travel inside the image, at
+/opt/strata/LICENSE and /opt/strata/third_party/. Maya is the same project's
+serve/ and tools/, unmodified. This patch and Dockerfile build on the tree at
+https://github.com/zephel01/Abyss commit c56e6d1.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
