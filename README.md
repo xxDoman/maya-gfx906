@@ -1,5 +1,9 @@
 # Maya + Strata on gfx906: DeepSeek-V4-Flash-0731 at 13.3 tok/s on one MI50
 
+As far as we know this is the only public `gfx906` (MI50 / MI60 / Radeon VII) build that runs
+DeepSeek-V4-Flash-0731 at all — llama.cpp gets it to 3.75 tok/s, nothing else publishes a working
+image. If you know of another, open an issue and it will be listed here.
+
 **Image:** `xxdoman/maya-gfx906:0.1` (alias `:latest`, digest
 `sha256:245c0d79b4bfa3ee7568398b5944aff545651c8a148ead2c8df01864d112113d`, 7.79 GB) — the upstream Maya
 dashboard (`serve/server.py`, unmodified) on top of the Strata engine built for `gfx906`, with the
