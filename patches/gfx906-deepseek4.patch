@@ -1,0 +1,456 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a77f691..902dcb7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -268,10 +268,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+                           src/kernels/cuda/verify_kernels.cu
+                           src/kernels/cuda/iq_kernels.cu
+                           src/kernels/cuda/glm_fast.cu
++                          # gfx906: glm_batch.cu stays - only its WMMA kernels are guarded (STRATA_HIP_WMMA=0),
++                          # the conversions/HC/DSA/KDA kernels in it are ordinary HIP and the DSV4 path calls them
+                           src/kernels/cuda/glm_batch.cu
++                          # gfx906: the entry points those two TUs define, stubbed so the tree links
++                          src/kernels/cuda/gfx906_stubs.cu
+                           src/kernels/cuda/dsv4_fast.cu
+                           src/kernels/cuda/dsv41_fast.cu
+-                          src/kernels/cuda/qwen35_fast.cu
++                          # src/kernels/cuda/qwen35_fast.cu
+                           src/kernels/cuda/exl3.cu
+                           src/kernels/cuda/exl3_legacy.cu
+                           src/kernels/ngram.cpp
+diff --git a/cmake/hip_backend.cmake b/cmake/hip_backend.cmake
+index 404f65b..5f55bf8 100644
+--- a/cmake/hip_backend.cmake
++++ b/cmake/hip_backend.cmake
+@@ -13,7 +13,7 @@ endif()
+ # same wave32 / 64 KiB LDS / sudot4 family as gfx1100, on a unified-memory APU; experimental.
+ set(_strata_hip_validated gfx1100 gfx1201)
+ set(_strata_hip_community gfx1101 gfx1200)
+-set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1034 gfx1150 gfx1151)   # gfx1103: Radeon 780M iGPU, opt-in, portable kernels (no WMMA)
++set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1034 gfx1150 gfx1151 gfx906)   # gfx1103: Radeon 780M iGPU, opt-in, portable kernels (no WMMA); gfx906: MI50/Radeon VII, wave64 port
+ # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
+ # spaces, which foreach(IN LISTS) would otherwise treat as one element.
+ string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
+@@ -47,6 +47,16 @@ set(CMAKE_HIP_ARCHITECTURES "${_strata_hip_norm}" CACHE STRING "Strata HIP targe
+ # carried to a card it has no code for stops at startup with a clear message instead of "invalid device function".
+ string(REPLACE ";" "," STRATA_HIP_ARCHS "${STRATA_HIP_ARCH_LIST}")
+ 
++# A WMMA build is a wave32 build: rocWMMA (and the raw v_wmma builtins behind it) exists on RDNA3/4 only.
++# gfx906 is wave64 GCN and has no matrix cores at all, so a build that carries gfx906 compiles the tree with
++# STRATA_HIP_WMMA=0: the rocWMMA translation unit's fast path drops out and the callers fall back to the plain
++# kernels. Everything else in those files (conversions, HC, DSA indexer, KDA) is ordinary HIP and stays.
++set(STRATA_HIP_WMMA 1)
++if("gfx906" IN_LIST STRATA_HIP_ARCH_LIST)
++  set(STRATA_HIP_WMMA 0)
++endif()
++message(STATUS "Strata: HIP WMMA kernels ${STRATA_HIP_WMMA}")
++
+ enable_language(HIP)
+ find_package(hip CONFIG REQUIRED)
+ find_package(hipblas CONFIG REQUIRED)
+@@ -72,7 +82,7 @@ set(STRATA_HIP_COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hi
+ add_library(strata_hip_runtime INTERFACE)
+ target_include_directories(strata_hip_runtime BEFORE INTERFACE
+   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+-target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
++target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 STRATA_HIP_WMMA=${STRATA_HIP_WMMA} "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
+ target_link_libraries(strata_hip_runtime INTERFACE hip::host)
+ foreach(_language IN ITEMS CXX HIP)
+   target_compile_options(strata_hip_runtime INTERFACE
+diff --git a/include/strata/kernels/cpu/expert_layout.hpp b/include/strata/kernels/cpu/expert_layout.hpp
+index 3197a1c..384aace 100644
+--- a/include/strata/kernels/cpu/expert_layout.hpp
++++ b/include/strata/kernels/cpu/expert_layout.hpp
+@@ -58,6 +58,8 @@ void act_quant_any(const float* x, int n, ActQ& a);
+ /// The process-wide layout (canonical Q2_0 until `expert_layout_load` finds a native pack).
+ const ExpertLayout& expert_layout();
+ /// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
++/// The expert geometry (n_embd / n_ff) comes from the pack's own header when it records it: the H/FF in expert.hpp
++/// are one family's canonical numbers (2560/640) and a pack of another family must be validated against its own.
+ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+ 
+ }  // namespace strata::kernels::cpu
+diff --git a/src/core/glm_prefill.cu b/src/core/glm_prefill.cu
+index ceeaf2d..c88157c 100644
+--- a/src/core/glm_prefill.cu
++++ b/src/core/glm_prefill.cu
+@@ -246,6 +246,9 @@ bool mla_f16_on() {
+ }
+ enum class MlaAttnPath { F32, F16Q, WMMA2 };
+ MlaAttnPath mla_attn_path() {
++#if defined(STRATA_USE_HIP) && !STRATA_HIP_WMMA
++    return MlaAttnPath::F32;   // gfx906: neither WMMA path is built, the plain F32 kernel is the only attention here
++#endif
+     if (!mla_wmma_on()) return MlaAttnPath::F32;   // STRATA_GLM_MLA_WMMA=0 keeps the F32 kernel as before
+     static const char* mode = getenv("STRATA_GLM_PREFILL_ATTN");
+     static const bool want_wmma2 = mode != nullptr && std::strcmp(mode, "wmma2") == 0;
+@@ -3069,8 +3072,32 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
+         int counted = 0;
+         for (int e = 0; e < NE; ++e) counted += S->h_counts[e];
+         if (counted != T * K) {
++            std::vector<int> h_ids((size_t) T * (size_t) K);
++            cudaMemcpy(h_ids.data(), M.ids, sizeof(int) * h_ids.size(), cudaMemcpyDeviceToHost);
++            int neg = 0, big = 0, inr = 0, mn = 1 << 30, mx = -(1 << 30), nonzero = 0;
++            for (int v : h_ids) {
++                if (v < 0) ++neg;
++                else { if (v < mn) mn = v; if (v > mx) mx = v; }
++                if (v >= NE) ++big;
++                if (v >= 0 && v < NE) ++inr;
++            }
++            std::vector<int> h_raw((size_t) NE);
++            cudaMemcpy(h_raw.data(), M.counts, sizeof(int) * h_raw.size(), cudaMemcpyDeviceToHost);
++            long long sum_raw = 0, sum_h = 0;
++            for (int e = 0; e < NE; ++e) { sum_raw += h_raw[e]; sum_h += S->h_counts[e]; }
++            std::fprintf(stderr, "[diag] NE %d T %d K %d sum(M.counts) %lld sum(h_counts) %lld counted %d\n",
++                         NE, T, K, sum_raw, sum_h, counted);
++            int hist[256] = {0};
++            for (int v : h_ids) if (v >= 0 && v < NE) ++hist[v];
++            int mism = 0;
++            for (int e = 0; e < NE && e < 256; ++e) if (hist[e] != S->h_counts[e]) ++mism;
++            for (int e = 0; e < NE; ++e) if (S->h_counts[e] != 0) ++nonzero;
+             err = "glm router: prompt layer " + std::to_string(il) + " invalid expert ID or non-finite score (" +
+-                  std::to_string(counted) + " of " + std::to_string(T * K) + " routes)";
++                  std::to_string(counted) + " of " + std::to_string(T * K) + " routes; T " + std::to_string(T) +
++                  " K " + std::to_string(K) + ", ids<0 " + std::to_string(neg) + ", ids>=NE " + std::to_string(big) +
++                  ", zakres " + std::to_string(mn) + ".." + std::to_string(mx) + ", niezerowych countów " +
++                  std::to_string(nonzero) + ", w zakresie z kopii " + std::to_string(inr) + ", rozjazdów hist/counts " +
++                  std::to_string(mism) + ")";
+             return false;
+         }
+         const auto tp = std::chrono::steady_clock::now();
+diff --git a/src/core/native_dense.cpp b/src/core/native_dense.cpp
+index ba30998..a90de95 100644
+--- a/src/core/native_dense.cpp
++++ b/src/core/native_dense.cpp
+@@ -21,7 +21,10 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
+         return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23);
+     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
+         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
+-        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
++        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight",
++        // deepseek4 (V4-Flash, 0731): MLA attention and the hash-routed expert id table
++        ".attn_kv.weight", ".attn_q_a.weight", ".attn_q_b.weight",
++        ".attn_output_a.weight", ".attn_output_b.weight", ".ffn_gate_tid2eid.weight"};
+     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+     return false;
+ }
+diff --git a/src/core/native_head.cpp b/src/core/native_head.cpp
+index fc9f694..d6d5840 100644
+--- a/src/core/native_head.cpp
++++ b/src/core/native_head.cpp
+@@ -110,8 +110,15 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
+         const strata::TensorInfo* t = nullptr;
+         for (const auto& c : gguf.tensors())
+             if (c.name == "token_embd.weight") t = &c;
+-        if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
+-            !strata::kernels::iq_supported((int) t->type) || n_embd % 256) {
++        // n_embd / n_vocab <= 0 means "the file is the authority": the model's own shape, not one family's defaults.
++        if (!t || t->shape.size() != 2 || !strata::kernels::iq_supported((int) t->type)) {
++            err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
++                  "dequantizer";
++            return false;
++        }
++        if (n_embd <= 0) n_embd = (int64_t) t->shape[0];
++        if (n_vocab <= 0) n_vocab = (int64_t) t->shape[1];
++        if (t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab || n_embd % 256) {
+             err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
+                   "dequantizer";
+             return false;
+diff --git a/src/kernels/cpu/expert_layout.cpp b/src/kernels/cpu/expert_layout.cpp
+index b3e5a2b..9f436ca 100644
+--- a/src/kernels/cpu/expert_layout.cpp
++++ b/src/kernels/cpu/expert_layout.cpp
+@@ -224,6 +224,8 @@ void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int,
+ #endif
+ 
+ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
++    // The model's expert geometry: the pack header's when it carries one, else the canonical family's.
++    int64_t n_embd = H, n_ff = FF;
+     ExpertLayout L;
+     L.n_layers = n_layers;
+     L.n_expert = n_expert;
+@@ -248,9 +250,14 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
+             if (!line.empty() && line[0] == '#') {
+                 // v3 packs record their expert count in the header; a pruned model (the Qwen Coder) ships
+                 // fewer experts than the canonical geometry the caller passes, which is a compile-time
+-                // default, so the header wins.
++                // default, so the header wins.  The same goes for the expert geometry: H/FF in expert.hpp
++                // are one family's numbers, and a pack of another family records its own.
+                 const size_t at = line.find("(n_expert ");
+                 if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
++                const size_t ae = line.find("n_embd ");
++                if (ae != std::string::npos) n_embd = std::atoll(line.c_str() + ae + 7);
++                const size_t af = line.find("n_ff ");
++                if (af != std::string::npos) n_ff = std::atoll(line.c_str() + af + 5);
+             }
+             continue;
+         }
+@@ -269,7 +276,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
+             return false;
+         }
+         NativeFmt f;
+-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
++        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err)) return false;
+         if (f.bytes != blob) {
+             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
+                   " B but its formats make " + std::to_string(f.bytes);
+@@ -292,7 +299,22 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
+         if (blob > L.max_blob) L.max_blob = blob;
+     }
+     uint64_t at = 0;
++    // The pack knows how many layers it carries: the caller's `n_layers` is the canonical family's compile-time
++    // default (48 next to a 43-layer model), so a pack of fewer layers would look truncated.  The header wins here
++    // the same way it does for the expert count.
++    int64_t pack_layers = 0;
+     for (int64_t l = 0; l < n_layers; ++l) {
++        if (L.offset[(size_t) l] != ~0ull) pack_layers = l + 1;
++    }
++    if (pack_layers > 0 && pack_layers < n_layers) {
++        L.n_layers = pack_layers;
++        L.fmt.resize((size_t) pack_layers);
++        L.offset.resize((size_t) pack_layers);
++        L.bytes.resize((size_t) pack_layers);
++        if (!L.gguf_off.empty()) L.gguf_off.resize((size_t) (3 * pack_layers));
++        if (!L.gguf_file.empty()) L.gguf_file.resize((size_t) pack_layers);
++    }
++    for (int64_t l = 0; l < L.n_layers; ++l) {
+         if (L.offset[(size_t) l] != at) {
+             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
+             return false;
+diff --git a/src/kernels/cpu/native_expert.cpp b/src/kernels/cpu/native_expert.cpp
+index d4d25aa..4b55e7c 100644
+--- a/src/kernels/cpu/native_expert.cpp
++++ b/src/kernels/cpu/native_expert.cpp
+@@ -235,7 +235,13 @@ bool native_fmt(int gu_type, int up_type, int d_type, int64_t n_embd, int64_t n_
+     if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_embd % ggml_blck_size((ggml_type) up_type) ||
+         n_ff % ggml_blck_size((ggml_type) d_type) ||
+         n_embd % ggml_blck_size(tg->vec_dot_type) || n_ff % ggml_blck_size(td->vec_dot_type)) {
+-        err = "native experts: expert geometry is not whole blocks";
++        err = "native experts: expert geometry is not whole blocks (n_embd " + std::to_string(n_embd) +
++              " / n_ff " + std::to_string(n_ff) + ", gate/up type " + std::to_string(gu_type) + "/" +
++              std::to_string(up_type) + " blck " + std::to_string(ggml_blck_size((ggml_type) gu_type)) + "/" +
++              std::to_string(ggml_blck_size((ggml_type) up_type)) + ", down type " + std::to_string(d_type) +
++              " blck " + std::to_string(ggml_blck_size((ggml_type) d_type)) + ", act blck " +
++              std::to_string(ggml_blck_size(tg->vec_dot_type)) + "/" +
++              std::to_string(ggml_blck_size(td->vec_dot_type)) + ")";
+         return false;
+     }
+     f.gu_type = gu_type;
+diff --git a/src/kernels/cuda/gfx906_stubs.cu b/src/kernels/cuda/gfx906_stubs.cu
+new file mode 100644
+index 0000000..7fa68db
+--- /dev/null
++++ b/src/kernels/cuda/gfx906_stubs.cu
+@@ -0,0 +1,61 @@
++// src/kernels/cuda/gfx906_stubs.cu
++//
++// gfx906 (MI50 / Radeon VII, wave64) builds without `qwen35_fast.cu`: that TU is built on rocWMMA and raw v_wmma
++// builtins, and rocWMMA refuses this arch at compile time ("static assertion failed: Unsupported architecture").
++// It holds no gfx906-capable code and the Qwen3.5 family is not what this build targets, so it is out of the
++// target and the entry points the rest of the tree references are defined here.
++//
++// `glm_batch.cu` is NOT stubbed: only its WMMA kernels are guarded out (STRATA_HIP_WMMA=0), and its ordinary HIP
++// kernels - the bf16/f16 conversions, HC, the DSA indexer, KDA - compile for gfx906 and are what the DeepSeek V4
++// path actually calls.
++//
++// Every stub ABORTS naming itself: reaching one means the run took a path this build cannot execute, and a silent
++// zero would corrupt the result far from the gate.
++#include <cstdio>
++#include <cstdlib>
++
++#include "strata/kernels/glm_batch.hpp"
++#include "strata/kernels/qwen35_fast.hpp"
++
++namespace {
++[[noreturn]] void gfx906_stub(const char* name) {
++    std::fprintf(stderr,
++                 "\n[gfx906] FATAL: %s is not built on this arch: it lives in the rocWMMA TU "
++                 "(qwen35_fast.cu), which does not compile for gfx906.\n", name);
++    std::fflush(stderr);
++    std::abort();
++}
++}  // namespace
++
++namespace strata::kernels::q35 {
++void add_rms_rows(float*, int, float const*, float const*, float, int, int, float*, void*, ihipStream_t*) { gfx906_stub("q35::add_rms_rows");  }
++void attn_decode(float const*, unsigned short const*, unsigned short const*, int, int, int, int, float, float*, float*, ihipStream_t*) { gfx906_stub("q35::attn_decode");  }
++bool attn_decode_rows(float const*, unsigned short const*, unsigned short const*, int const*, int, int const*, int, int, int, int, int, float, float*, float*, ihipStream_t*, int) { gfx906_stub("q35::attn_decode_rows"); return false; }
++void attn_gate(float*, float const*, int, int, ihipStream_t*) { gfx906_stub("q35::attn_gate");  }
++void attn_gate_rows(float*, float const*, int, int, int, ihipStream_t*) { gfx906_stub("q35::attn_gate_rows");  }
++void attn_kv_rows(float const*, float const*, float const*, float, int, int, int, float, long, int, unsigned short*, unsigned short*, ihipStream_t*) { gfx906_stub("q35::attn_kv_rows");  }
++size_t attn_part_floats(int, int, int) { gfx906_stub("q35::attn_part_floats"); return 0; }
++void attn_prep(float const*, float const*, float const*, float const*, float const*, float, int, int, int, int, float, int, unsigned short*, unsigned short*, float*, ihipStream_t*) { gfx906_stub("q35::attn_prep");  }
++void attn_prep_rows(float const*, float const*, float const*, float const*, float const*, float, int, int, int, int, float, long, int, unsigned short*, unsigned short*, float*, ihipStream_t*) { gfx906_stub("q35::attn_prep_rows");  }
++void attn_prompt(float const*, unsigned short const*, unsigned short const*, int, int, int, long, int, float, float*, ihipStream_t*) { gfx906_stub("q35::attn_prompt");  }
++void attn_window(float const*, unsigned short const*, unsigned short const*, int, int, int, long, int, float, float*, float*, ihipStream_t*) { gfx906_stub("q35::attn_window");  }
++size_t attn_window_floats(int, int, int, int) { gfx906_stub("q35::attn_window_floats"); return 0; }
++void conv_rows(float const*, int, int, float const*, int, float*, float*, ihipStream_t*) { gfx906_stub("q35::conv_rows");  }
++void conv_silu_step(float*, float const*, float const*, int, int, float*, ihipStream_t*) { gfx906_stub("q35::conv_silu_step");  }
++void conv_state_rows(float const*, int, int, int, float*, ihipStream_t*) { gfx906_stub("q35::conv_state_rows");  }
++void gather_rows(unsigned short const*, unsigned short const*, int const*, int, int, unsigned short*, unsigned short*, ihipStream_t*) { gfx906_stub("q35::gather_rows");  }
++void gdn_core(float*, float const*, int, int, float const*, float const*, int, int, int, bool, float, float const*, float const*, float const*, float const*, float, float*, void*, ihipStream_t*) { gfx906_stub("q35::gdn_core");  }
++void gdn_prep_gates(float*, int, int, int, int, float, float*, float*, float const*, float const*, int, ihipStream_t*) { gfx906_stub("q35::gdn_prep_gates");  }
++void gdn_scan(float*, float const*, int, int, float const*, float const*, int, int, int, float*, ihipStream_t*) { gfx906_stub("q35::gdn_scan");  }
++void hc4_combine_norm(float*, float const*, float const*, int, float const*, float, int, int, int, float*, ihipStream_t*, void*) { gfx906_stub("q35::hc4_combine_norm");  }
++void hc4_fused(float*, float const*, float const*, float const*, float, int, int, int, void const*, void const*, void const*, float*, float*, float*, float*, float*, float*, void*, ihipStream_t*, bool) { gfx906_stub("q35::hc4_fused");  }
++void hc4_fused_cols(float*, float const*, float const*, int, float const*, float, int, int, int, int, void const*, void const*, void const*, float*, float*, float*, float*, float*, float*, void*, ihipStream_t*, bool) { gfx906_stub("q35::hc4_fused_cols");  }
++bool hc4_fused_cols_ok(int, int, int, int, int, int, int) { gfx906_stub("q35::hc4_fused_cols_ok"); return false; }
++bool hc4_fused_ok(int, int, int, int, int, int) { gfx906_stub("q35::hc4_fused_ok"); return false; }
++void hc4_mix(float const*, float const*, int, int, int, float*, ihipStream_t*, void*) { gfx906_stub("q35::hc4_mix");  }
++void scale_sigmoid(float*, int, float const*, ihipStream_t*) { gfx906_stub("q35::scale_sigmoid");  }
++void scale_sigmoid_rows(float*, int, int, float const*, ihipStream_t*) { gfx906_stub("q35::scale_sigmoid_rows");  }
++void shexp_gate_rows(float const*, float const*, float*, int, int, ihipStream_t*) { gfx906_stub("q35::shexp_gate_rows");  }
++void silu_scale(float*, int, float, ihipStream_t*, void*) { gfx906_stub("q35::silu_scale");  }
++void top_prob(float const*, int, int const*, float*, ihipStream_t*) { gfx906_stub("q35::top_prob");  }
++}  // namespace strata::kernels::q35
+diff --git a/src/kernels/cuda/glm_batch.cu b/src/kernels/cuda/glm_batch.cu
+index ff92571..bfee18d 100644
+--- a/src/kernels/cuda/glm_batch.cu
++++ b/src/kernels/cuda/glm_batch.cu
+@@ -4,7 +4,10 @@
+ // (same operation order where the order is observable), so a prompt read in chunks leaves the state the token path
+ // would have left up to float rounding - the projections around them (FP16 tensor-core GEMMs instead of q8_1 dot
+ // products) are where the two paths really differ, as llama.cpp's batched and one-token paths do.
+-#if defined(STRATA_USE_HIP)
++#ifndef STRATA_HIP_WMMA
++#define STRATA_HIP_WMMA 1   // the build sets this to 0 on an arch without WMMA (gfx906)
++#endif
++#if defined(STRATA_USE_HIP) && STRATA_HIP_WMMA
+ // The HIP bf16/fp8 headers rocWMMA pulls in define the __shfl_*_sync names that the force-included hip_compat macros
+ // remap; hide the macros while they are read.
+ #pragma push_macro("__shfl_xor_sync")
+@@ -1227,7 +1230,7 @@ __global__ void __launch_bounds__(256) mla_attn_mma_kernel(const float* __restri
+ }
+ #endif
+ 
+-#if defined(STRATA_USE_HIP)
++#if defined(STRATA_USE_HIP) && STRATA_HIP_WMMA
+ // mla_attn_tc_kernel on RDNA3 WMMA (rocWMMA).  RDNA allows 64 KiB of LDS a workgroup, the CUDA kernel takes 91,
+ // so Q (FP16, from the q_abs product) stays in registers - each warp holds its 64-wide K slice of the 16 heads as four
+ // A fragments - and the cells go in chunks of 16: O 32 KiB (F32) + L 16 KiB + score partials 8 KiB + P 0.5 KiB.
+@@ -1475,6 +1478,10 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
+         }
+ }
+ 
++// The kernels above are the WMMA ones and drop out with STRATA_HIP_WMMA=0; the arch probe below is host code and
++// stays, so gfx906 still answers "3 - unsupported" and every caller takes the plain kernel.
++#endif
++#if defined(STRATA_USE_HIP)
+ // Per device, the wave32 WMMA path: 0 not probed yet, 1 gfx12 (supported, the default), 2 gfx11 (supported),
+ // 3 anything else (unsupported).
+ int mla_wmma2_arch() {
+@@ -1693,24 +1700,21 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
+ 
+ __global__ void __launch_bounds__(256) expert_count_kernel(const int* __restrict__ ids, int n, int* __restrict__ counts,
+                                                            int* __restrict__ rank) {
+-    const int e = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+-    __shared__ int s_wc[8];
+-    int base = 0;
+-    for (int c0 = 0; c0 < n; c0 += 256) {
+-        const int i = c0 + tid;
+-        const bool m = i < n && ids[i] == e;
+-        const unsigned ballot = __ballot_sync(0xffffffffu, m);
+-        if (lane == 0) s_wc[warp] = __popc(ballot);
+-        __syncthreads();
+-        int off = base;
+-        for (int w2 = 0; w2 < warp; ++w2) off += s_wc[w2];
+-        if (m) rank[i] = off + __popc(ballot & ((1u << lane) - 1u));
+-        int tot = 0;
+-        for (int w2 = 0; w2 < 8; ++w2) tot += s_wc[w2];
+-        base += tot;
+-        __syncthreads();
++    // Wave-size independent: gfx906 runs wave64, and a ballot over 0xffffffff with lane = tid & 31
++    // counted the wrong lanes there (sum(counts) drifted above T*K). One running counter per expert,
++    // bumped in shared memory, gives the same ranks without any warp assumption.
++    const int e = blockIdx.x, tid = threadIdx.x;
++    __shared__ int s_cnt;
++    if (tid == 0) s_cnt = 0;
++    __syncthreads();
++    for (int i = tid; i < n; i += blockDim.x) {
++        if (ids[i] == e) {
++            const int r = atomicAdd(&s_cnt, 1);
++            rank[i] = r;
++        }
+     }
+-    if (tid == 0) counts[e] = base;
++    __syncthreads();
++    if (tid == 0) counts[e] = s_cnt;
+ }
+ 
+ __global__ void expert_scatter_kernel(const int* __restrict__ ids, const int* __restrict__ rank,
+@@ -2019,7 +2023,7 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
+     check("mla_attn");
+ }
+ 
+-#if defined(STRATA_USE_HIP)
++#if defined(STRATA_USE_HIP) && STRATA_HIP_WMMA
+ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
+                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
+     if (T <= 0) return;
+@@ -2048,6 +2052,23 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
+     mla_attn_wmma2_kernel<<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+     check("mla_attn_wmma2");
+ }
++#else
++// gfx906 (STRATA_HIP_WMMA=0): no matrix cores, so neither WMMA attention path exists. mla_wmma2_arch() reports 3
++// unsupported and glm_prefill takes the plain mla_attn() kernel; forcing one of these by env is a run this build
++// cannot do, and it says so instead of returning a plausible wrong answer.
++#include <cstdlib>
++void mla_attn_f16q(const uint16_t*, const uint16_t*, const int*, const int*, int, int, int, float, int, float*,
++                   cudaStream_t, bool) {
++    std::fprintf(stderr, "glm_batch mla_attn_f16q: not built for this arch (no WMMA; STRATA_HIP_WMMA=0)\n");
++    std::abort();
++}
++bool mla_wmma2_supported() { return false; }
++bool mla_wmma2_default() { return false; }
++void mla_attn_wmma2(const float*, const uint16_t*, const int*, const int*, int, int, int, float, int, float*,
++                    cudaStream_t, bool) {
++    std::fprintf(stderr, "glm_batch mla_attn_wmma2: not built for this arch (no WMMA; STRATA_HIP_WMMA=0)\n");
++    std::abort();
++}
+ #endif
+ 
+ void head_rows(const float* R, const float* w, float eps, int T, int n_embd, float* h, cudaStream_t s) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index fdfbb83..23799e1 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -3664,11 +3664,18 @@ int main(int argc, char** argv) {
+             return 2;
+         }
+         const strata::core::ModelGeometry g0;
+-        if (!native_embed.load(o.native_preset, g0.n_embd, 248320, err)) {
+-            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+-            return 1;
++        // 0/0: the shape comes from the file, not a family default.  STRATA_SKIP_NATIVE_EMBED=1 is a diagnostic:
++        // run on the pack's own token_embd (dense.bin) instead, to see what lies past the embedding check.
++        if (!native_embed.load(o.native_preset, 0, 0, err)) {
++            if (std::getenv("STRATA_SKIP_NATIVE_EMBED") == nullptr) {
++                std::fprintf(stderr, "maya generate: %s\n", err.c_str());
++                return 1;
++            }
++            std::fprintf(stderr, "maya generate: WARNING skipping the native embedding (%s); the pack's own "
++                                 "token_embd serves instead\n", err.c_str());
++        } else {
++            strata::core::set_native_embed(&native_embed);
+         }
+-        strata::core::set_native_embed(&native_embed);
+         std::fprintf(stderr, "maya generate: native pack: %s experts (largest blob %.2f MB), token embedding "
+                              "type %d in mapped host memory (%.0f MiB)\n",
+                      o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
+diff --git a/tools/iq_pack.py b/tools/iq_pack.py
+index 2309fe4..c6197b9 100644
+--- a/tools/iq_pack.py
++++ b/tools/iq_pack.py
+@@ -742,8 +742,9 @@ def main() -> int:
+         version = "v4" if straddle else "v3"
+         fo.write("# strata native experts %s: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
+                  "[shard | gate_shard up_shard down_shard] "
+-                 "(n_expert %d, total %d; absolute offsets in %s, or in the named shard(s) beside it)\n"
+-                 % (version, n_expert, offset, src.name))
++                 "(n_expert %d, n_embd %d, n_ff %d, total %d; absolute offsets in %s, or in the named "
++                 "shard(s) beside it)\n"
++                 % (version, n_expert, int(layout[0][5][0].shape[0]), int(layout[0][5][0].shape[1]), offset, src.name))
+         for l, gt, dt, off, blob, ts in layout:
+             ws = [model.where[t.name] for t in ts]
+             shards = [w[3] for w in ws]

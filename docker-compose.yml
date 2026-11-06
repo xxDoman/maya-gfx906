@@ -1,0 +1,21 @@
+services:
+  maya:
+    image: xxdoman/maya-gfx906:0.1
+    container_name: maya
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    ulimits:
+      memlock: -1
+    ports:
+      - "8092:8092"
+    volumes:
+      - /home/models:/models
+      - maya-data:/data
+    restart: unless-stopped
+
+volumes:
+  maya-data:
