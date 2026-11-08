@@ -270,18 +270,25 @@ the config, because it lives in the `maya-data` volume.
 
 ## What does not work
 
-- **No MTP runtime for this pack — but the engine has the feature.** The unsloth GGUF ships no
-  `mtp`/`nextn` tensors (1328 tensors, zero), so there is nothing to load and `--spec` drafting here is
-  n-gram/suffix only. The engine itself supports the model's own MTP head through `--mtp DIR`, and
-  `tools/mtp_fetch.py` + `tools/mtp_pack.py` build that directory out of the **original BF16
-  checkpoint's** `mtp.*` tensors over HTTP range reads — no full checkpoint, ~0.71 GB packed at `q2_0`
-  (~1.42 GB at `q4_0`), with draft acceptance measured per format. Both tools are pinned to another
-  model's repo, revision and expert geometry today; pointing them at
-  `deepseek-ai/DeepSeek-V4-Flash-0731` is the missing work, and it is a port, not a research problem.
+- **No MTP for this model — measured, not inferred.** `--mtp DIR` is accepted and then silently ignored on
+  this pack: with `--spec 4 --mtp …` pointing at the real pack directory the engine starts, reports
+  `mtp=0 … drafter=none` in its INFO line and drafts from n-grams only. The reason is structural: the MTP
+  runtime (`src/core/mtp.cpp`) is written for the QSA architecture — 0 references to MLA, a hardcoded
+  `mtp: the 512 experts do not fit in VRAM`, and the load path sits inside the branch that owns
+  `n_qsa_layers()`. The 0731 draft layer is MLA (`wq_a`, `wq_b`, `wkv`, `wo_a`, `wo_b`, `attn_sink`) with
+  256 experts and a `tid2eid` map, so it is a different layer, not a different file.
+- **The draft weights exist and are MXFP4.** The original checkpoint carries 4705 `mtp.0.*` tensors in
+  shards 46–48, 10.86 GB in total — 2329 `F8_E8M0` scales, 2304 `I8` packed nibbles, 25 `F8_E4M3`,
+  20 BF16, 27 F32. That is the same block MXFP4 the model uses for its experts everywhere else, and it is
+  exactly what `dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf` (10.90 GB) in bartowski's repo contains. So MTP
+  here needs two things at once, in this order: MXFP4 kernels, then a draft runner for this architecture.
+- **What is available today: n-gram/suffix drafting, and it pays.** `--spec N` needs no draft model. On one
+  MI50 with this pack, a deliberately repetitive 17-token prompt gave `3 of 4 drafts accepted (75%)` and
+  16.49 tok/s (60.65 ms/token) against the 13.3 tok/s tabulated above; a repetitive prompt flatters
+  acceptance, so treat that as an upper bound and not as the number for real chat.
 - **`--dspark` does not exist in this build.** The binary's options are `--spec`, `--spec-min-p`,
   `--spec-split`, `--spec-oracle`, `--mtp`, `--mtp-max-t`, `--mtp-window`; `--dspark` is llama.cpp's own
-  drafter and this engine never read it. `--spec N` drafts from n-gram context, and it does pay: ~80%
-  acceptance reported on the 2-card config above.
+  drafter and this engine never read it.
 - **Images and MCP** are off in the config (`images: false`, `mcp` disabled).
 - **Prefill is disk-bound on a single card** with a 3-shard IQ2_XXS pack: 190–210 tok/s is a 6899-token
   prompt in 38 s, and it does not improve with more slots — the experts for a prompt are streamed, not
