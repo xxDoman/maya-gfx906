@@ -124,8 +124,16 @@ you change quant, and nothing else in that line.
 
 ## Two cards
 
-Nothing extra on the `docker run` line: both cards arrive through `/dev/dri` anyway. The **config** decides
-whether the second one is used:
+Both cards arrive through `/dev/dri`, but **neither the config nor the environment alone is enough** — this
+was measured the hard way on a two-card host (X99, 2× MI50 32 GB, 128 GB DDR3):
+
+| `-e ROCR_VISIBLE_DEVICES=0,1 -e HIP_VISIBLE_DEVICES=0,1` | `"gpu": "0,1"` + `"layer_split": "auto"` | result |
+| --- | --- | --- |
+| yes | yes | 19.5 tok/s, 89% of routed experts in VRAM, 0.00 disk reads/token |
+| **no** | yes | **16.0 tok/s, 60% hit rate**, RAM >90 GB — loaded CUDA0 only |
+
+Without the environment variables the engine prints `layer split across GPUs [0, 1] (auto)` and then loads
+one card anyway, which is the worst possible failure: it looks right. So set both.
 
 ```json
 "gpu": "0,1",
@@ -133,9 +141,7 @@ whether the second one is used:
 ```
 
 `serve/server.py` turns that into `--gpu 0,1` and appends `--layer-split auto` to the engine's own
-arguments. `ROCR_VISIBLE_DEVICES=0,1` alone is *not* enough: it makes both cards visible and asks for no
-split, which is how a two-card host ends up running on one card while looking correct. The engine
-announces what it decided:
+arguments. The engine announces what it decided:
 
 ```
 glm split auto: layers [0, 21) on CUDA0, [21, 43) on CUDA1 - a token 19.8 ms predicted
@@ -148,9 +154,10 @@ A ready config for 2× MI50 32 GB ships in the image as `/opt/maya/defaults/stra
 docker run -d --name maya \
   --device /dev/kfd --device /dev/dri --group-add video --group-add render \
   --ulimit memlock=-1 -p 8092:8092 \
+  -e ROCR_VISIBLE_DEVICES=0,1 -e HIP_VISIBLE_DEVICES=0,1 \
   -e DEFAULT_CONFIG=strata-dsv4-2x.json \
   -v /path/to/models:/models -v maya-data:/data \
-  xxdoman/maya-gfx906:0.1
+  xxdoman/maya-gfx906:0.2-mxfp4
 ```
 
 `DEFAULT_CONFIG` matters only on the first start — an existing `/data/maya/strata-dsv4.json` is never
