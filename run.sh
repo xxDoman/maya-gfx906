@@ -10,6 +10,13 @@
 #
 # --ulimit memlock=-1 jest obowiazkowe: bez niego silnik nie zapnie tieru RAM
 # ekspertow i zawiesi sie na mlock.
+#
+# Dwie karty: nic nie trzeba dopisywac do docker run — obie przechodza przez
+# /dev/dri. Drugiej karty uzyje dopiero config: "gpu": "0,1" + "layer_split":
+# "auto". Samo ROCR_VISIBLE_DEVICES=0,1 daje widocznosc bez splitu warstw,
+# czyli host z dwiema kartami policzy na jednej i bedzie wygladac poprawnie.
+# Gotowy config: -e DEFAULT_CONFIG=strata-dsv4-2x.json (tylko przy pierwszym
+# starcie, potem /data/maya/strata-dsv4.json jest zrodlem prawdy).
 set -e
 docker run -d --name maya \
   --device /dev/kfd --device /dev/dri \

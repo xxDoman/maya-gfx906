@@ -1,6 +1,6 @@
 # maya-gfx906 — Maya dashboard on the Strata engine, built for AMD gfx906
 #
-#   docker build -f Dockerfile.maya -t xxdoman/maya-gfx906:0.1 .
+#   docker build -f Dockerfile -t xxdoman/maya-gfx906:0.1 .
 #   docker run -d --name maya --device /dev/kfd --device /dev/dri \
 #       --group-add video --group-add render --ulimit memlock=-1 \
 #       -p 8092:8092 -v /path/to/models:/models -v maya-data:/data \
@@ -13,7 +13,8 @@
 # Layout follows xxdoman/strata-mi50:
 #   /opt/strata/engine/strata   engine (gfx906, deepseek4 pack path fixed)
 #   /opt/maya/serve             Maya (upstream server, not a fork)
-#   /opt/maya/defaults          config copied to /data on the first start
+#   /opt/maya/defaults          configs copied to /data on the first start
+#                               (strata-dsv4.json = 1 card, strata-dsv4-2x.json = 2 cards)
 #   /models /data /work         volumes
 
 ARG BASE=xxdoman/strata-mi50:0.2.9
@@ -65,6 +66,7 @@ COPY --from=build /src/serve /opt/maya/serve
 COPY --from=build /src/tools/strata_tokenizer.py /opt/maya/tools/strata_tokenizer.py
 COPY --from=build /src/tools/gguf_reader.py /opt/maya/tools/gguf_reader.py
 COPY maya/config/strata-dsv4.json /opt/maya/defaults/strata-dsv4.json
+COPY maya/config/strata-dsv4-2x.json /opt/maya/defaults/strata-dsv4-2x.json
 COPY maya/docker-entrypoint.sh /opt/maya/docker-entrypoint.sh
 
 RUN chmod +x /opt/strata/engine/strata /opt/maya/docker-entrypoint.sh

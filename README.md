@@ -12,7 +12,11 @@
   3.75 tok/s (measured below).
 
 What this image adds is narrower and specific: the Strata engine's **deepseek4 pack path fixed for the
-0731 UD-IQ2_XXS pack**, sized for one card.
+0731 pack**, sized for one card, with a second config and a measured setup for two.
+
+Two configs ship in `/opt/maya/defaults/`: `strata-dsv4.json` (one card, IQ2_XXS, 8k — the setup measured
+below) and `strata-dsv4-2x.json` (2× 32 GB, IQ3_S, 128k — the setup measured in
+[issue #3](https://github.com/xxDoman/strata-gfx906/issues/3)).
 
 **Image:** `xxdoman/maya-gfx906:0.1` (alias `:latest`, digest
 `sha256:245c0d79b4bfa3ee7568398b5944aff545651c8a148ead2c8df01864d112113d`, 7.79 GB) — the upstream Maya
@@ -84,8 +88,100 @@ limit is free; on the host it needs `sudo prlimit --memlock=unlimited:unlimited 
 
 **Config lives on a volume, not in the image.** On the first start the entrypoint copies
 `/opt/maya/defaults/strata-dsv4.json` to `/data/maya/strata-dsv4.json` and never overwrites it again, so
-edits survive container restarts and image updates. Models are mounted at `/models`; the pack's shard
-symlinks are relative for exactly that reason.
+edits survive container restarts and image updates. Which default is seeded is up to you:
+`-e DEFAULT_CONFIG=strata-dsv4-2x.json` starts from the two-card one.
+
+## Where the model has to sit
+
+The config names absolute container paths, so this layout is not a suggestion — no Dockerfile can find a
+pack mounted somewhere else. `the model's tokenizer is missing` at start is always this one thing:
+
+```
+/models/abyss/0731/        the pack directory — it carries tokenizer/ inside it
+/models/abyss/*.gguf       the model shards, named as the config's --ple-gguf expects
+```
+
+`tokenizer` in the JSON is `/models/abyss/0731/tokenizer`, a path *inside* the pack, and `--glm-pack` is
+the pack directory itself. Two ways to get there:
+
+```sh
+# 1. the whole models tree under /models (what the one-line docker run above does)
+-v /path/to/models:/models          # /path/to/models/abyss/0731/ and /path/to/models/abyss/*.gguf
+
+# 2. the pack somewhere else: mount each piece onto the name the config asks for
+-v /data/gguf/UD-IQ3_S/pack-dsv4:/models/abyss/0731
+-v /data/gguf/UD-IQ3_S/…-00001-of-00004.gguf:/models/abyss/…-00001-of-00004.gguf
+…
+```
+
+A symlink to a host path does not work — inside the container that path does not exist. Mount the target
+onto the expected name instead.
+
+**`--ple-gguf` must name a shard that exists.** Layer 1's PLE lives in it, and the engine says so in
+capitals: `WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED, which changes every number downstream`. A stale
+filename from another quant starts fine and is quietly not the same model — change the shard name when
+you change quant, and nothing else in that line.
+
+## Two cards
+
+Nothing extra on the `docker run` line: both cards arrive through `/dev/dri` anyway. The **config** decides
+whether the second one is used:
+
+```json
+"gpu": "0,1",
+"layer_split": "auto"
+```
+
+`serve/server.py` turns that into `--gpu 0,1` and appends `--layer-split auto` to the engine's own
+arguments. `ROCR_VISIBLE_DEVICES=0,1` alone is *not* enough: it makes both cards visible and asks for no
+split, which is how a two-card host ends up running on one card while looking correct. The engine
+announces what it decided:
+
+```
+glm split auto: layers [0, 21) on CUDA0, [21, 43) on CUDA1 - a token 19.8 ms predicted
+(CUDA0 9.2 ms, 139 slots a layer | CUDA1 10.2 ms, 129 slots a layer), 89% of the routed experts in VRAM
+```
+
+A ready config for 2× MI50 32 GB ships in the image as `/opt/maya/defaults/strata-dsv4-2x.json`:
+
+```sh
+docker run -d --name maya \
+  --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+  --ulimit memlock=-1 -p 8092:8092 \
+  -e DEFAULT_CONFIG=strata-dsv4-2x.json \
+  -v /path/to/models:/models -v maya-data:/data \
+  xxdoman/maya-gfx906:0.1
+```
+
+`DEFAULT_CONFIG` matters only on the first start — an existing `/data/maya/strata-dsv4.json` is never
+overwritten. Extra arguments after the image name reach the server too (`… xxdoman/maya-gfx906:0.1
+--gpu 0,1`), which is what the entrypoint's passthrough is for.
+
+### Measured on 2× MI50 32 GB + 128 GB DDR3 (X99), IQ3_S, 128k context
+
+Reproduced by [@glennhanks](https://github.com/glennhanks) in
+[issue #3](https://github.com/xxDoman/strata-gfx906/issues/3) — a different box from the host tabulated
+below, so the two sets of numbers are not directly comparable.
+
+| | |
+| --- | --- |
+| model | `unsloth/DeepSeek-V4-Flash-0731-UD-IQ3_S`, 116.07 GB, 4 shards |
+| pack | built with **Abyss's own tooling**, not `tools/iq_pack.py` — the engine loads both |
+| context | 131072, with `--kv-resident 20480` and `STRATA_GLM_RAM_GB=100` |
+| decode | 19.53 tok/s (51.19 ms/token): `vram hit 89.23%`, `ram fetches 1.52/tok`, `disk 0.00 reads/tok` |
+| prefill | ~150–200 tok/s (1275 tokens in 4.1 s, 3987 in 21.9 s) |
+| split | `[0, 21)` on CUDA0, `[21, 43)` on CUDA1, 139 / 129 slots per layer |
+| drafting | `--spec 1` (n-gram), reported ~80% acceptance |
+
+Two things worth knowing before tuning on a high-RAM host:
+
+- **`--kv-resident 20480` is what makes 128k fit.** It keeps the KV of 20480 cells of each QSA layer in
+  pinned RAM and spends the freed VRAM on expert slots; without it the same config OOMs. The engine
+  accepts nothing below 20480, and the help says `not with --kv k8v4` — do not combine them.
+- **The RAM tier is what stops the SSD thrashing.** At the default 32 GB with a 116 GB model, experts come
+  off the disk every token; at 100 GB the log reads `disk 0.00 reads/tok`. `--glm-ram-resident` is the
+  stricter variant of the same idea — it refuses to start unless the tier holds every expert the VRAM
+  does not (see `strata --help`).
 
 ## The config is upstream's, not ours
 
@@ -131,15 +227,32 @@ curl http://localhost:8092/v1/chat/completions -H 'Content-Type: application/jso
 **Anthropic-compatible:** `POST /v1/messages` on the same port. Also `/v1/models`, `/v1/status`,
 `/metrics`, `/slots`, `/status`.
 
-**Changing the config** (context, RAM tier, sampling, log path):
+**Changing the config** (context, RAM tier, sampling, model paths, GPU count): the JSON is the only source
+of truth, and it lives in the `maya-data` volume.
 
 ```sh
-docker exec -it maya sh -c 'vi /data/maya/strata-dsv4.json'   # or edit the file in the maya-data volume
+docker exec -it maya sh -c 'vi /data/maya/strata-dsv4.json'   # or edit the file in the volume
 docker restart maya
 ```
 
-`STRATA_GLM_RAM_GB` can also be set on `docker run -e`, and the entrypoint passes it to the engine;
-`--max-context` and the model paths live in the JSON.
+Engine settings reach the process from two places — the container's environment and the config's own
+`"env"` block — and **the config wins**: `serve/server.py` builds the engine's environment from its own,
+then applies `"env"` over it. That is why, in the `:0.1` image on the Hub, `-e STRATA_GLM_RAM_GB=96` does
+nothing at all while the key sits in the JSON (and in the shipped default it does). Two honest routes:
+
+```sh
+# a. the entrypoint in this repo writes -e into the config and says so:
+docker run ... -e STRATA_GLM_RAM_GB=96 ...        # -> [maya] env.STRATA_GLM_RAM_GB -> 96 in /data/...
+
+# b. on a published image, edit the JSON — this is the only reliable way there:
+docker run --rm -v maya-data:/data --entrypoint python3 xxdoman/maya-gfx906:0.1 -c \
+  'import json,sys; p="/data/maya/strata-dsv4.json"; c=json.load(open(p)); \
+   c["env"]["STRATA_GLM_RAM_GB"]="96"; json.dump(c,open(p,"w"),indent=2)'
+docker restart maya
+```
+
+`--max-context`, `--kv-resident`, `--prefill`, the model paths and `--ple-gguf` are engine arguments and
+live in the `args` array, not in `env`.
 
 **Exposing it beyond localhost.** The entrypoint binds `0.0.0.0` so the dashboard is reachable from the
 LAN, and by default the API has **no key**. Either publish it on the loopback interface only —
@@ -157,14 +270,23 @@ the config, because it lives in the `maya-data` volume.
 
 ## What does not work
 
-- **No MTP / speculative decoding.** The original weights have one MTP layer
-  (`num_nextn_predict_layers = 1`, tensors `mtp.0.hc_head_base`, `mtp.0.hc_attn_fn`, … in the safetensors
-  index) — the unsloth GGUF does not: 1328 tensors, zero `mtp`/`nextn`, and no separate MTP file in the
-  repo. So there is no draft head to serve, and `--spec-type draft-mtp` has nothing to point at. An
-  external draft model would have to match this tokenizer.
+- **No MTP runtime for this pack — but the engine has the feature.** The unsloth GGUF ships no
+  `mtp`/`nextn` tensors (1328 tensors, zero), so there is nothing to load and `--spec` drafting here is
+  n-gram/suffix only. The engine itself supports the model's own MTP head through `--mtp DIR`, and
+  `tools/mtp_fetch.py` + `tools/mtp_pack.py` build that directory out of the **original BF16
+  checkpoint's** `mtp.*` tensors over HTTP range reads — no full checkpoint, ~0.71 GB packed at `q2_0`
+  (~1.42 GB at `q4_0`), with draft acceptance measured per format. Both tools are pinned to another
+  model's repo, revision and expert geometry today; pointing them at
+  `deepseek-ai/DeepSeek-V4-Flash-0731` is the missing work, and it is a port, not a research problem.
+- **`--dspark` does not exist in this build.** The binary's options are `--spec`, `--spec-min-p`,
+  `--spec-split`, `--spec-oracle`, `--mtp`, `--mtp-max-t`, `--mtp-window`; `--dspark` is llama.cpp's own
+  drafter and this engine never read it. `--spec N` drafts from n-gram context, and it does pay: ~80%
+  acceptance reported on the 2-card config above.
 - **Images and MCP** are off in the config (`images: false`, `mcp` disabled).
-- **Prefill is disk-bound** on a 3-shard IQ2_XXS pack: 190–210 tok/s is a 6899-token prompt in 38 s, and
-  it does not improve with more slots — the experts for a prompt are streamed, not cached.
+- **Prefill is disk-bound on a single card** with a 3-shard IQ2_XXS pack: 190–210 tok/s is a 6899-token
+  prompt in 38 s, and it does not improve with more slots — the experts for a prompt are streamed, not
+  cached. With two cards and a RAM tier large enough for the model, the same prefill comes from RAM
+  (`disk 0.00 reads/tok`) and the number is no longer about the disk.
 
 ## What the patch contains
 
@@ -187,7 +309,7 @@ Kernel parity on gfx906 (no WMMA port needed): `glm_hc_parity`, `glm_dsa_parity`
 ```sh
 git clone https://github.com/xxDoman/strata-gfx906
 cd strata-gfx906
-docker build -f Dockerfile.maya -t xxdoman/maya-gfx906:0.1 .
+docker build -f Dockerfile -t xxdoman/maya-gfx906:0.1 .
 ```
 
 The engine is compiled inside the image from upstream source plus the patch. A binary built on the host

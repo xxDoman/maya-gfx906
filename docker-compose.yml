@@ -15,6 +15,11 @@ services:
     volumes:
       - /home/models:/models
       - maya-data:/data
+    # environment:
+    #   # only read on the FIRST start, when the config is seeded into maya-data
+    #   DEFAULT_CONFIG: strata-dsv4-2x.json      # two cards, IQ3_S, 128k
+    #   # these are written into the config's "env" by the entrypoint
+    #   STRATA_GLM_RAM_GB: "96"
     restart: unless-stopped
 
 volumes:
