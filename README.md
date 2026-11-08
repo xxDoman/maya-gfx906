@@ -356,6 +356,65 @@ parameter, i.e. **156 GB** for this model, against 93 GB of VRAM + RAM here (32 
 DDR4). It streams from NVMe at that point — the engine does read experts from disk — but at ~2-3 tok/s,
 which is why the format belongs to 2× 32 GB cards + 128 GB hosts.
 
+## Running an MXFP4 pack (image `0.2-mxfp4`, experimental)
+
+`xxdoman/maya-gfx906:0.2-mxfp4` is `0.1` plus both patches (`gfx906-deepseek4.patch`,
+`002-mxfp4-decode.patch`) — the only published image that can read MXFP4 expert blobs. Normal packs run on
+it exactly as on `0.1` (13.1/14.1 tok/s against 12.3/13.9 on the same two prompts), so it is a superset, not
+a fork. What it has never done is carry a real MXFP4 model: nobody has run one, because a 156 GB pack does
+not fit on the host this was built on. Treat it as a test build and expect to send back a log.
+
+Step by step, from an empty `/models`:
+
+```sh
+# 1. the shards (bartowski, MXFP4, 156.38 GB in four files)
+mkdir -p /models/abyss/mxfp4 && cd /models/abyss/mxfp4
+for i in 00001 00002 00003 00004; do
+  curl -LO "https://huggingface.co/bartowski/DeepSeek-V4-Flash-0731-GGUF/resolve/main/\
+DeepSeek-V4-Flash-0731-MXFP4/DeepSeek-V4-Flash-0731-MXFP4-$i-of-00004.gguf"
+done
+
+# 2. the pack (dense.bin, index.txt, native_experts.txt, tokenizer/) from those shards
+python3 tools/abyss_setup.py --model v4 --quant /models/abyss/mxfp4 --pack /models/abyss/0731-mxfp4
+```
+
+Step 2 is the part nobody has run against MXFP4 — the pack builder is the same one that produced the IQ2_XXS
+pack, and an MXFP4 expert blob is a different type in `native_experts.txt` than it expected. If it refuses,
+the message is the useful part.
+
+```sh
+# 3. smoke test: the engine straight up, no Maya, one prompt
+docker run --rm -it \
+  --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+  --ulimit memlock=-1 \
+  -e STRATA_GLM_RAM_GB=96 -v /models:/models \
+  --entrypoint /opt/strata/engine/strata xxdoman/maya-gfx906:0.2-mxfp4 \
+  --glm-pack /models/abyss/0731-mxfp4 \
+  --ple-gguf /models/abyss/mxfp4/DeepSeek-V4-Flash-0731-MXFP4-00004-of-00004.gguf \
+  --tokens 671,6102,294,8760,344 --max-new 32 --max-context 1024
+
+# 4. or the whole server, with the config in this repo
+docker run --rm -d --name maya \
+  --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+  --ulimit memlock=-1 -p 8092:8092 \
+  -e DEFAULT_CONFIG=strata-dsv4-mxfp4.json \
+  -v /models:/models -v maya-data:/data \
+  -v "$PWD/maya/config/strata-dsv4-mxfp4.json:/opt/maya/defaults/strata-dsv4-mxfp4.json:ro" \
+  xxdoman/maya-gfx906:0.2-mxfp4
+```
+
+Two details that cost an afternoon if you miss them. `--ple-gguf` wants the **dense** shard, the one with the
+embeddings and the tokenizer — for bartowski's layout that is `-00004-of-00004.gguf` (1220 tensors), while
+`-00001` through `-00003` are pure expert blobs (35 tensors each, all type 39). And the pack directory must
+contain a `tokenizer/` folder, because Maya reads it from the pack path, not from the shards.
+
+Known gaps in this build: **prefill has no quantised matmul for MXFP4** (`moe_mmq.cu` has no case 39), so a
+long prompt goes through whatever fallback the router picks — decode was the part that was ported first,
+because decode is what decides tokens per second. `--kv-resident` and `--spec` behave as on any other pack.
+
+If it falls over, these are the lines worth quoting back: `error:`/`glm pack:` at load, `glm router: prompt
+layer N invalid expert ID` at prefill, and the `glm stat:` line (vram hit, disk reads/token) at decode.
+
 ## Speculative decoding: DSpark, and why it loses on one card
 
 The engine ships a drafter for 0731 that nobody was turning on, because it is not a CLI flag: `--dspark`
