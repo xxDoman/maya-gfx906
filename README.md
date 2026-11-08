@@ -356,6 +356,47 @@ parameter, i.e. **156 GB** for this model, against 93 GB of VRAM + RAM here (32 
 DDR4). It streams from NVMe at that point — the engine does read experts from disk — but at ~2-3 tok/s,
 which is why the format belongs to 2× 32 GB cards + 128 GB hosts.
 
+## Speculative decoding: DSpark, and why it loses on one card
+
+The engine ships a drafter for 0731 that nobody was turning on, because it is not a CLI flag: `--dspark`
+does not exist and `--mtp` never reaches a pack (`generate.cpp` leaves through `glm_pack_generate()` before
+the session code, which is why every pack run logs `drafter=none`). DSpark is a **separate distilled
+drafter**, `src/core/dspark.cu`, 1025 lines, 3 stages over target layers 40-42, 256 experts a stage, 5
+drafts a step, and it is enabled by environment:
+
+```sh
+-e STRATA_DS4_DSPARK=/models/gguf/DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf   # 6.94 GB
+-e STRATA_DS4_DSPARK_EXPERTS=64      # optional: shrink the drafter's expert cache (256 = 5.91 GB)
+args: "--spec", "5"
+```
+
+The file must be the **MarkovQ8** variant from `bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF`:
+`dspark.cu:395` wants `dspark.markov_w2.weight` as Q8_0, and the plain `Q2K-Q8-0731` file fails to load with
+`markov_w2.weight has another type or shape`. It loads on gfx906 with no port — `3 stages over target
+layers 40-42, 5 drafts a step; 6.48 GB on CUDA0`.
+
+Measured here, server mode (so the real tokenizer), three natural prompts — Polish technical prose, a Polish
+letter, English prose — 160 tokens each, temperature 0, 8192 context, one MI50, IQ2_XXS. Mean decode:
+
+| arm | decode | acceptance | tokens/step | expert slots | disk reads/tok |
+| --- | --- | --- | --- | --- | --- |
+| `--spec 4`, no drafter | **13.7 tok/s** | 0-100% of 1-3 windows | — | 3354 | 4.3-10.6 |
+| DSpark, 256 experts a stage | 9.6 tok/s | 48 / 64 / 69% | 2.0-2.2 | 2451 | 8.9-20.7 |
+| DSpark, 64 experts a stage | 10.7 tok/s | 52 / 60 / 71% | 1.9-2.4 | 3053 | 5.8-12.5 |
+
+DSpark loses, by 22-30%, and the reason is visible in the same table: a verify window costs ~210-240 ms and
+returns ~2.1 tokens, i.e. ~100-115 ms per token, against ~70 ms for a plain single-token step. The drafter
+also evicts 500-900 expert slots, so the main model streams more from disk while drafting. Shrinking the
+drafter's expert cache to 64 a stage recovers most of those slots and 1.1 tok/s, but not the deficit.
+
+The +44% this drafter showed on a deliberately repetitive prompt (98% acceptance, all windows) is an
+artifact of that prompt — on natural text acceptance is 48-71%. And on natural text n-gram drafting barely
+fires at all (1-3 windows per 160 tokens), so `--spec 4` is nearly free and nearly useless for chat.
+
+Conclusion for this box: leave DSpark off by default. Where the 6.48 GB is 10% of VRAM instead of 20% — a
+2× 32 GB host with 128 GB of RAM — the trade is a different one, and that is worth measuring there before
+saying anything about it.
+
 ## Building the image
 
 ```sh
