@@ -33,7 +33,8 @@ WORKDIR /src
 COPY patches/ /patches/
 RUN git clone --filter=blob:none ${SRC_REPO} /src \
     && git -C /src checkout ${SRC_COMMIT} \
-    && git -C /src apply /patches/gfx906-deepseek4.patch
+    && git -C /src apply /patches/gfx906-deepseek4.patch \
+    && git -C /src apply /patches/002-mxfp4-decode.patch
 
 RUN cmake -S /src -B /src/build-gfx906 \
         -DCMAKE_BUILD_TYPE=Release \

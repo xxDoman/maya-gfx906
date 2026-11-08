@@ -1,0 +1,272 @@
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 1813731..56f4a50 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -31,6 +31,14 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
+     x32 |= x16[2 * i32 + 1] << 16;
+     return x32;
+ }
++__device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
++    const uint8_t* x8 = (const uint8_t*) x;
++    int x32 = x8[4 * i32 + 0] << 0;
++    x32 |= x8[4 * i32 + 1] << 8;
++    x32 |= x8[4 * i32 + 2] << 16;
++    x32 |= x8[4 * i32 + 3] << 24;
++    return x32;
++}
+ __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
+ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
+     const uint32_t p = __popc(v) & 1;
+@@ -293,6 +301,27 @@ __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vb
+     return d * sumi;
+ }
+ 
++// MXFP4 (ggml type 39, ggml-cuda vecdotq.cuh vec_dot_mxfp4_q8_1): a block is 32 values as 16 bytes of nibbles
++// plus one e8m0 exponent byte; the codebook holds 2x the FP4 values (e2m1 max 6 fits an int8 only doubled),
++// hence the 0.5f. Same block geometry and same iqs stride as IQ4_NL, so only the scale read differs.
++__device__ __forceinline__ float e8m0_to_fp32(const uint8_t e) { return exp2f((float) (int) e - 127.0f); }
++
++__device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
++                                                    const int& kbx, const int& iqs) {
++    const block_mxfp4* bq4 = (const block_mxfp4*) vbq + kbx;
++    const int* q8 = (const int*) bq8_1->qs + iqs;
++    int sumi = 0;
++#pragma unroll
++    for (int l = 0; l < 2; ++l) {
++        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
++        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
++        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
++        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
++    }
++    const float d = e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
++    return d * sumi;
++}
++
+ // IQ4_XS: 256 values as 8 sub-blocks of 32 (6-bit scale each); one call covers one sub-block (iqs = 4 * sub-block),
+ // and `bq8_1` is the super-block's first q8_1 block, so the call's activation is bq8_1[iqs / 4].  Strata's Qwen IQ3_S
+ // file keeps one layer's routed gate/up experts in this format.
+@@ -326,6 +355,8 @@ template<> struct Fmt<18> { static constexpr int qk = 256, ipb = 8, step = 2;
+     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_xxs_q8_1(v, y, kbx, iqs); } };
+ template<> struct Fmt<20> { static constexpr int qk = 32, ipb = 2, step = 2;
+     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs); } };
++template<> struct Fmt<39> { static constexpr int qk = 32, ipb = 2, step = 2;   // MXFP4: 32 values, e8m0 scale
++    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_mxfp4_q8_1(v, y, kbx, iqs); } };
+ template<> struct Fmt<21> { static constexpr int qk = 256, ipb = 8, step = 2;
+     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_s_q8_1(v, y, kbx, iqs); } };
+ template<> struct Fmt<23> { static constexpr int qk = 256, ipb = 8, step = 4;
+@@ -606,6 +637,18 @@ __device__ void dq_iq4_xs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+     }
+ }
+ template<typename dst_t>
++__device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
++    const block_mxfp4* x = (const block_mxfp4*) vx + ibs * (QK_K / QK_MXFP4);
++    const int64_t il = tid / 8, ib = tid % 8;
++    dst_t* y = yy + 32 * ib + 4 * il;
++    const uint8_t* q4 = x[ib].qs + 4 * il;
++    const float d = e8m0_to_fp32(x[ib].e) * 0.5f;
++    for (int j = 0; j < 4; ++j) {
++        y[j + 0] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]);
++        y[j + 16] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] >> 4]);
++    }
++}
++template<typename dst_t>
+ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+     // one "superblock" = 256 values = 4 blocks of 64; thread tid writes 8 values
+     const block_q2_0* x = (const block_q2_0*) vx + ibs * 4;
+@@ -632,6 +675,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
+         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+         case 11: dq_q3_k(vx, ibs, y, tid); break;
+         case 42: dq_q2_0(vx, ibs, y, tid); break;
++        case 39: dq_mxfp4(vx, ibs, y, tid); break;
+         default: break;
+     }
+ }
+@@ -651,7 +695,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
+     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
+ }
+ 
+-bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11; }
++bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 || t == 39; }
+ 
+ }  // namespace
+ 
+@@ -676,6 +720,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
+         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
+         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
+         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
++        case 39: return (size_t) (n / 32) * sizeof(block_mxfp4);
+         default: return 0;
+     }
+ }
+@@ -704,6 +749,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
+         case 29: mmvq_kernel<29><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+         case 19: mmvq_kernel<19><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+         case 42: mmvq_kernel<42><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
++        case 39: mmvq_kernel<39><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
+     }
+     check("iq_mmvq");
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 2bd52c8..a317a01 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -1440,8 +1440,8 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
+ bool native_mmvq_supported(int ggml_type) noexcept {
+     return ggml_type == 2 || ggml_type == 6 || ggml_type == 8 || ggml_type == 11 ||
+            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
+-           ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
+-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
++           ggml_type == 23 || ggml_type == 42 || ggml_type == 39 || ggml_type == 16 || ggml_type == 17 ||
++           ggml_type == 18 || ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+ }
+ 
+ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
+@@ -1458,6 +1458,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
+     case 14: block_elems = 256; block_bytes = 210; break;
+     case 23: block_elems = 256; block_bytes = 136; break;
+     case 42: block_elems = 64; block_bytes = 18; break;
++    case 39: block_elems = 32; block_bytes = 17; break;   // MXFP4: e8m0 byte + 16 bytes of nibbles
+     case 16: case 17: case 18: case 19: case 21: case 22: case 29:
+         block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
+     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
+@@ -1484,7 +1485,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float*
+     case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+-    case 16: case 17: case 18: case 19: case 21: case 22: case 29:
++    case 16: case 17: case 18: case 19: case 21: case 22: case 29: case 39:
+         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
+     }
+diff --git a/src/kernels/iq_mxfp4_parity.cpp b/src/kernels/iq_mxfp4_parity.cpp
+new file mode 100644
+index 0000000..9823106
+--- /dev/null
++++ b/src/kernels/iq_mxfp4_parity.cpp
+@@ -0,0 +1,126 @@
++// src/kernels/iq_mxfp4_parity.cpp - MXFP4 (ggml type 39) on gfx906 against a CPU reference.
++//
++//     hipcc -x hip --offload-arch=gfx906 -O2 -std=c++17 \
++//       -I include -I include/strata/hip_compat -I third_party/ggml \
++//       src/kernels/iq_mxfp4_parity.cpp src/kernels/cuda/iq_kernels.cu -o iq_mxfp4_parity
++//
++// What is checked, in this order:
++//   1. iq_supported(39) and iq_row_bytes(39, n) == 17 * n / 32   (addressing: this is what returned 0 before).
++//   2. iq_dequant_f32(39) against the block layout decoded on the host: 32 values per 17-byte block, one e8m0
++//      exponent, nibble j -> value j and nibble j+16 -> value j+16, codebook kvalues_fp4 halved.
++//   3. iq_mmvq(39) (q8_1 activations, the expert path) against the float dot -- agreement to activation rounding.
++//
++// No fixture files: the blocks are generated here, so the test runs anywhere the engine runs.
++#include "strata/kernels/iq_kernels.hpp"
++
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <vector>
++
++namespace {
++
++constexpr int BLOCK = 32;            // values per MXFP4 block
++constexpr int BLOCK_BYTES = 17;      // uint8_t e + 16 bytes of nibbles
++// ggml-common.h, kvalues_fp4: the FP4 codebook stored doubled, so the dequant multiplies by 0.5.
++const int8_t KV[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
++
++int failures = 0;
++
++void check(bool ok, const char* what) {
++    std::printf("%-58s %s\n", what, ok ? "ok" : "FAIL");
++    if (!ok) ++failures;
++}
++
++double rel_err(const std::vector<float>& got, const std::vector<double>& ref) {
++    double num = 0.0, den = 0.0;
++    for (size_t i = 0; i < ref.size(); ++i) {
++        num += std::fabs((double) got[i] - ref[i]);
++        den += std::fabs(ref[i]);
++    }
++    return num / (den + 1e-30);
++}
++
++}  // namespace
++
++int main() {
++    const int n_blocks = 64;                 // 2048 values: a multiple of 256, so iq_dequant_f32 takes it
++    const int n = n_blocks * BLOCK;
++
++    std::mt19937 rng(1234);
++    std::uniform_int_distribution<int> nib(0, 15);
++    std::uniform_int_distribution<int> expo(120, 136);   // scales 2^-7 .. 2^9: away from the subnormal edge
++
++    std::vector<uint8_t> raw((size_t) n_blocks * BLOCK_BYTES);
++    std::vector<double> ref((size_t) n, 0.0);
++    for (int b = 0; b < n_blocks; ++b) {
++        uint8_t* blk = raw.data() + (size_t) b * BLOCK_BYTES;
++        blk[0] = (uint8_t) expo(rng);                     // e8m0
++        const double scale = std::ldexp(1.0, (int) blk[0] - 127) * 0.5;
++        for (int j = 0; j < 16; ++j) {
++            const uint8_t byte = (uint8_t) ((nib(rng) & 0xF) | ((nib(rng) & 0xF) << 4));
++            blk[1 + j] = byte;
++            ref[(size_t) b * BLOCK + j] = scale * KV[byte & 0xF];
++            ref[(size_t) b * BLOCK + j + 16] = scale * KV[byte >> 4];
++        }
++    }
++
++    cudaStream_t s;
++    if (cudaStreamCreate(&s) != cudaSuccess) {
++        std::printf("cudaStreamCreate failed\n");
++        return 1;
++    }
++
++    // 1. addressing
++    check(strata::kernels::iq_supported(39), "iq_supported(39)");
++    check(strata::kernels::iq_row_bytes(39, n) == (size_t) n_blocks * BLOCK_BYTES,
++          "iq_row_bytes(39, 2048) == 64 * 17");
++
++    void* dw = nullptr;
++    if (cudaMalloc(&dw, raw.size()) != cudaSuccess) {
++        std::printf("cudaMalloc failed\n");
++        return 1;
++    }
++    cudaMemcpy(dw, raw.data(), raw.size(), cudaMemcpyHostToDevice);
++
++    // 2. dequant
++    float* ddq = nullptr;
++    cudaMalloc(&ddq, (size_t) n * 4);
++    strata::kernels::iq_dequant_f32(39, dw, n, ddq, s);
++    std::vector<float> got_dq((size_t) n, 0.0f);
++    cudaMemcpy(got_dq.data(), ddq, (size_t) n * 4, cudaMemcpyDeviceToHost);
++    const double dq_err = rel_err(got_dq, ref);
++    std::printf("iq_dequant_f32(39) relative error: %.3e\n", dq_err);
++    check(dq_err < 1e-6, "dequant matches the block layout decoded on the host");
++
++    // 3. the dot, one row of weights against one q8_1 column
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++    std::vector<float> x((size_t) n);
++    for (auto& v : x) v = nd(rng);
++    double want = 0.0;
++    for (int i = 0; i < n; ++i) want += ref[(size_t) i] * (double) x[(size_t) i];
++
++    float* dx = nullptr;
++    void* xq = nullptr;
++    float* dy = nullptr;
++    cudaMalloc(&dx, (size_t) n * 4);
++    cudaMalloc(&xq, (size_t) n / 32 * sizeof(int8_t) * 36);   // block_q8_1: 36 bytes, generous
++    cudaMalloc(&dy, sizeof(float));
++    cudaMemcpy(dx, x.data(), (size_t) n * 4, cudaMemcpyHostToDevice);
++    strata::kernels::quantize_q8_1_rows(dx, 1, n, xq, s);
++    strata::kernels::iq_mmvq(39, dw, xq, dy, n, 1, 1, s);
++    float got_y = 0.0f;
++    cudaMemcpy(&got_y, dy, sizeof(float), cudaMemcpyDeviceToHost);
++    const double dot_err = std::fabs((double) got_y - want) / (std::fabs(want) + 1e-30);
++    std::printf("iq_mmvq(39) dot: got %.6f want %.6f  relative error %.3e\n", (double) got_y, want, dot_err);
++    check(dot_err < 5e-3, "mmvq dot matches the float dot to activation rounding");
++
++    cudaFree(dw); cudaFree(ddq); cudaFree(dx); cudaFree(xq); cudaFree(dy);
++    cudaStreamDestroy(s);
++
++    std::printf("iq_mxfp4_parity: %s\n", failures == 0 ? "PASS" : "FAIL");
++    return failures == 0 ? 0 : 1;
++}

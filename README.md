@@ -311,6 +311,51 @@ the config, because it lives in the `maya-data` volume.
 Kernel parity on gfx906 (no WMMA port needed): `glm_hc_parity`, `glm_dsa_parity`, `glm_kda_parity` —
 `--selftest` PASS ×3.
 
+`patches/002-mxfp4-decode.patch` (3 files, 180 insertions) adds the engine's missing MXFP4 decode path — see
+below.
+
+## MXFP4 (ggml type 39)
+
+The model's original checkpoint is quantised MXFP4, and bartowski ships only that format, so the engine
+had to learn one more block type to read those files at all. Type 39 used to fall through
+`iq_row_bytes()`'s `default: return 0`, which means an MXFP4 expert blob could not even be addressed.
+
+What went in:
+
+| file | change |
+| --- | --- |
+| `src/kernels/cuda/iq_kernels.cu` | `vec_dot_mxfp4_q8_1` (port of ggml-cuda's, 20 lines: the codebook is stored doubled, hence the `0.5f`, and the scale is one e8m0 byte read with `2^(e-127)` instead of an fp16 `d`); `get_int_b1`; `dq_mxfp4`; `Fmt<39>` (qk 32, ipb 2, step 2 — same block geometry as IQ4_NL); `iq_row_bytes(39)`; `is_iq(39)`; the `iq_mmvq` launch |
+| `src/kernels/cuda/native_mmvq.cu` | `native_mmvq_supported(39)`, 32 values / 17 bytes in `native_mmvq_weight_bytes`, and dispatch to `iq_mmvq` |
+| `src/kernels/iq_mxfp4_parity.cpp` | the test: random blocks generated in the program, decoded on the host, compared against the kernels |
+
+**Verified on one MI50**, `iq_mxfp4_parity` (parity, not a model run):
+
+```
+iq_supported(39)                                           ok
+iq_row_bytes(39, 2048) == 64 * 17                          ok
+iq_dequant_f32(39) relative error: 0.000e+00
+dequant matches the block layout decoded on the host       ok
+iq_mmvq(39) dot: got -25230.642578 want -25160.014481  relative error 2.807e-03
+mmvq dot matches the float dot to activation rounding      ok
+iq_mxfp4_parity: PASS
+```
+
+To rebuild the test (no fixture files, no model):
+
+```sh
+hipcc -x hip --offload-arch=gfx906 -O2 -std=c++17 \
+  -I include -I include/strata/hip_compat -I third_party/ggml \
+  src/kernels/iq_mxfp4_parity.cpp src/kernels/cuda/iq_kernels.cu -o iq_mxfp4_parity
+./iq_mxfp4_parity
+```
+
+**What is not there yet: the MMQ prefill path.** `moe_mmq.cu` still has no MXFP4 case, so a prompt on an
+MXFP4 pack has no quantised-matmul path — decode is served, prefill is not. Nobody has run a full MXFP4
+model on this build, and it cannot be finished on the host this was written on: MXFP4 is 4.25 bits per
+parameter, i.e. **156 GB** for this model, against 93 GB of VRAM + RAM here (32 GB on the card, 61 GB of
+DDR4). It streams from NVMe at that point — the engine does read experts from disk — but at ~2-3 tok/s,
+which is why the format belongs to 2× 32 GB cards + 128 GB hosts.
+
 ## Building the image
 
 ```sh
