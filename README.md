@@ -214,7 +214,26 @@ everything in the upstream `docs/MANUAL.md` applies, only the paths differ.
 ```sh
 docker ps --filter name=maya
 curl -s localhost:8092/health          # {"status": "ok", ...}
-docker logs -f maya                   # the engine's own log
+tail -f /data/maya/logs/abyss-server.log   # inside the container: the engine's own log, NOT docker logs
+```
+
+**`docker logs maya` is the wrong stream for engine lines.** `serve/server.py` starts the engine with
+`stderr` pointed at the log file (`/data/maya/logs/abyss-server.log`) and `stdout` on a pipe it reads, so
+everything the engine says — `glm pack:`, `glm split`, `glm stat:`, `dspark:`, errors — lands in that file
+and never in the container's stdout. To read it from outside:
+
+```sh
+docker exec maya grep -i dspark /data/maya/logs/abyss-server.log    # or
+docker run --rm -v maya-data:/data --entrypoint cat xxdoman/maya-gfx906:0.2-mxfp4.1 /data/maya/logs/abyss-server.log
+```
+
+Engine knobs travel the same way as the engine's log: `docker run -e STRATA_ANYTHING=value` is copied into
+the config's `env` block on start (every `STRATA_*` name, not a fixed list) and the entrypoint prints the
+resulting set, so you can see what the engine actually got:
+
+```
+[maya] env silnika w configu: STRATA_DS4_DSPARK=/models/gguf/DSpark-...gguf STRATA_DS4_DSPARK_EXPERTS=64
+STRATA_GLM_RAM_GB=32 STRATA_GLM_TIMING=1
 ```
 
 A start takes about a minute: the dense weights go to the GPU, then every expert is read into the VRAM

@@ -39,6 +39,11 @@ export LD_LIBRARY_PATH=/opt/rocm/lib
 # procesu: samo `-e STRATA_GLM_RAM_GB=96` bylo po cichu ignorowane, dopoki
 # klucz siedzial w JSON-ie (a w domyslnym siedzi). Zmienna podana z zewnatrz
 # jest wiec wpisywana do configu i mowimy o tym glosno.
+#
+# Bierzemy KAZDA zmienna STRATA_* — nie liste czterech. Poprzednia whitelista
+# (STRATA_GLM_*) polykala `-e STRATA_DS4_DSPARK=...` bez slowa: silnik nie
+# zaczynal nawet czytac pliku draftu, wiec w logu nie bylo ANI JEDNEJ linii
+# o dspark i wygladalo to na brak wsparcia.
 patch_env() {
     python3 - "$CONFIG" "$1" "$2" <<'PY'
 import json, sys
@@ -55,12 +60,19 @@ if str(env.get(key, "")) != val:
 PY
 }
 
-for var in STRATA_GLM_RAM_GB STRATA_GLM_RAM_RESIDENT STRATA_GLM_TIMING STRATA_GLM_RAM_THP; do
+for var in $(env | sed -n 's/^\(STRATA_[A-Z0-9_]*\)=.*/\1/p'); do
     eval "val=\${$var:-}"
     if [ -n "$val" ]; then
         patch_env "$var" "$val"
     fi
 done
+
+echo "[maya] env silnika w configu: $(python3 - "$CONFIG" <<'PY'
+import json, sys
+env = (json.load(open(sys.argv[1])).get("env") or {})
+print(" ".join("%s=%s" % (k, v) for k, v in sorted(env.items()) if k.startswith("STRATA_")) or "-")
+PY
+)"
 
 RAM_TIER=$(python3 - "$CONFIG" <<'PY'
 import json, sys
