@@ -65,6 +65,19 @@ touched per token. With 3354 slots on the card plus 4508 in pinned RAM, 71 % of 
 resident, so a token still pulls ~430 MB through the NVMe — at 13 tok/s that is ~6 disk reads per token,
 which is what `glm stat` reports (`6.3 reads/token, 3.3 RAM fetches/token`).
 
+**Why a 2× 32 GB host only reaches ~19.5 tok/s, and not 40.** It is VRAM residency, not RAM speed. Measured
+elsewhere (X99, 2× MI50 32 GB, 128 GB DDR3 quad-channel): 89 % of routed experts in VRAM, `0.00 disk
+reads/token`, 19.5 tok/s. This box: 75 %, ~4 disk reads/token, 15.4 tok/s. Doubling the hardware buys 27 %,
+because the second card removes the *disk*, not the arithmetic — and single-token decode is bound by expert
+bytes, of which the tier still has to move 1.94 GB per token.
+
+The DDR3 is innocent: four channels of DDR3-1866 (59.7 GB/s) or DDR3-2133 (68.3 GB/s) is within a few
+percent of this box's dual-channel DDR4-3200 (51.2 GB/s), and at 89 % VRAM hit it is barely asked to work.
+The 128 GB matters as *capacity* — it holds the whole tier with room for the drafter's evictions — not as
+bandwidth. Buying RAM instead of a second card does not buy this: on this box the tier at 40 GB (`14.2 tok/s`
+on a single long request) measured *slower* than 32 GB, because a bigger pinned tier takes page cache away
+and ~2160 experts still come off the SSD.
+
 ## Running it
 
 ```sh
