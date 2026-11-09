@@ -483,16 +483,23 @@ The drafter also evicts 500-900 expert slots, so the main model streams more fro
 Shrinking the drafter's expert cache to 64 a stage recovers most of those slots and 1.1 tok/s, but not the
 deficit.
 
-**The deficit is the RAM tier, not the card.** The same DSpark configuration (64 experts a stage, 2.05 GB on
-the card) measured on a 128 GB host with one MI50:
+**The cost is the expert tier, not the card.** Our own clean pair on this box — same prompts, same harness, five
+requests an arm, tier 32, `--spec 4` against `--spec 5`:
 
-| 1× MI50, DSpark at 64 experts/stage | decode | acceptance | disk reads/tok | RAM tier |
+| arm | median decode | acceptance | slots in VRAM | disk reads/tok |
 | --- | --- | --- | --- | --- |
-| 61 GB of RAM (here) | 10.7 tok/s | 52-71% | 5.8-12.5 | 32 GB, spills |
-| 128 GB of RAM | **15.36 tok/s** | 75% | **0.00** | ~70 GB, holds |
+| DSpark on | 12.0 tok/s | 50-69% | 2838 | 4.4-7.2 |
+| DSpark off | **15.4 tok/s** | — | 3354 | 2.9-4.8 |
 
-The evicted experts land in RAM instead of on the SSD, so the window stops paying for disk. That is +44% over
-the same drafter settings here, and past the 13.7 tok/s this box gets without a drafter at all.
+A drafter buys fewer forward passes per token and charges 516 VRAM slots plus 1.5-2× the disk traffic. On a host
+whose tier spills to NVMe that is a net loss of about 22%.
+
+**On a 128 GB host the second half of that cost goes away, and the size of the win is not measured.** The same
+drafter settings there (64 experts a stage, 2.05 GB on the card) gave 15.36 tok/s, 75% acceptance and
+`disk 0.00 reads/tok` — everything evicted landed in RAM. That is not a clean delta, because that host has no
+DSpark-off baseline in the same configuration: part of the 15.36 is the RAM, not the drafter. What the datapoint
+does establish is the mechanism — the drafter evicts ~25 points of VRAM hit rate and, with enough RAM, the
+eviction is free.
 
 **DSpark refuses a layer split.** `dspark.cu:187` gives up unless the target runs on a single device
 (`n_parts == 1 && l0 == 0 && l1 == n_layers`), and says so:
@@ -504,9 +511,10 @@ dspark: not loaded - DeepSeek V4 / V4.1 Flash on one device only (no split, no M
 So on a two-card host it is either the split without a drafter (~19.5 tok/s at 89% VRAM hit) or one card with
 the drafter (~15.4 tok/s at 75% acceptance). Not both — pick before measuring.
 
-Rule of thumb from the two measurements: DSpark pays when the expert tier is big enough to absorb the eviction
-without touching the disk. One card with plenty of RAM: yes. One card whose tier spills to NVMe: no. Two
-cards: the split wins anyway.
+Rule of thumb from the measurements: DSpark pays when the expert tier is big enough to absorb the eviction
+without touching the disk, and it only ever applies to a single card. One card, tier spilling to NVMe: no. One
+card with RAM to spare: probably, but measure it against a DSpark-off run on the same host before believing it.
+Two cards: the split wins anyway.
 
 The +44% this drafter showed on a deliberately repetitive prompt (98% acceptance, all windows) is an artifact
 of that prompt — on natural text acceptance is 48-75%. And on natural text n-gram drafting barely fires at all
