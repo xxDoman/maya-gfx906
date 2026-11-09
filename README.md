@@ -243,6 +243,14 @@ is up.
 
 **Browser:** `http://<host>:8092/` — chat, the live expert-tier/GPU monitor, settings.
 
+**The Monitor's Hardware tab needs `"backend": "hip"` in the config.** Without that key `serve/server.py`
+never builds the AMD card list (`server.py:3498` only does it for `backend == "hip"`), the sampler falls back
+to NVML, and an AMD box has no NVML — so GPU active, VRAM, power, temperature and PCIe all show `–` while CPU,
+RAM and disk work fine. It is not a permissions problem: `/sys` is visible inside the container already, and
+reading the card directly gives `temp 44 C, power 23 W, pcie gen4 x4, 923 MHz` on this MI50. The three configs
+in `maya/config/` ship with the key, and the entrypoint adds it to an older volume on start
+(`[maya] config bez "backend" — dopisano "hip"`).
+
 **OpenAI-compatible API:** base URL `http://<host>:8092/v1`, any model name.
 
 ```sh
@@ -469,18 +477,40 @@ letter, English prose — 160 tokens each, temperature 0, 8192 context, one MI50
 | DSpark, 256 experts a stage | 9.6 tok/s | 48 / 64 / 69% | 2.0-2.2 | 2451 | 8.9-20.7 |
 | DSpark, 64 experts a stage | 10.7 tok/s | 52 / 60 / 71% | 1.9-2.4 | 3053 | 5.8-12.5 |
 
-DSpark loses, by 22-30%, and the reason is visible in the same table: a verify window costs ~210-240 ms and
-returns ~2.1 tokens, i.e. ~100-115 ms per token, against ~70 ms for a plain single-token step. The drafter
-also evicts 500-900 expert slots, so the main model streams more from disk while drafting. Shrinking the
-drafter's expert cache to 64 a stage recovers most of those slots and 1.1 tok/s, but not the deficit.
+DSpark loses on this box, by 22-30%, and the reason is visible in the same table: a verify window costs
+~210-240 ms and returns ~2.1 tokens, i.e. ~100-115 ms per token, against ~70 ms for a plain single-token step.
+The drafter also evicts 500-900 expert slots, so the main model streams more from disk while drafting.
+Shrinking the drafter's expert cache to 64 a stage recovers most of those slots and 1.1 tok/s, but not the
+deficit.
 
-The +44% this drafter showed on a deliberately repetitive prompt (98% acceptance, all windows) is an
-artifact of that prompt — on natural text acceptance is 48-71%. And on natural text n-gram drafting barely
-fires at all (1-3 windows per 160 tokens), so `--spec 4` is nearly free and nearly useless for chat.
+**The deficit is the RAM tier, not the card.** The same DSpark configuration (64 experts a stage, 2.05 GB on
+the card) measured on a 128 GB host with one MI50:
 
-Conclusion for this box: leave DSpark off by default. Where the 6.48 GB is 10% of VRAM instead of 20% — a
-2× 32 GB host with 128 GB of RAM — the trade is a different one, and that is worth measuring there before
-saying anything about it.
+| 1× MI50, DSpark at 64 experts/stage | decode | acceptance | disk reads/tok | RAM tier |
+| --- | --- | --- | --- | --- |
+| 61 GB of RAM (here) | 10.7 tok/s | 52-71% | 5.8-12.5 | 32 GB, spills |
+| 128 GB of RAM | **15.36 tok/s** | 75% | **0.00** | ~70 GB, holds |
+
+The evicted experts land in RAM instead of on the SSD, so the window stops paying for disk. That is +44% over
+the same drafter settings here, and past the 13.7 tok/s this box gets without a drafter at all.
+
+**DSpark refuses a layer split.** `dspark.cu:187` gives up unless the target runs on a single device
+(`n_parts == 1 && l0 == 0 && l1 == n_layers`), and says so:
+
+```
+dspark: not loaded - DeepSeek V4 / V4.1 Flash on one device only (no split, no MTP)
+```
+
+So on a two-card host it is either the split without a drafter (~19.5 tok/s at 89% VRAM hit) or one card with
+the drafter (~15.4 tok/s at 75% acceptance). Not both — pick before measuring.
+
+Rule of thumb from the two measurements: DSpark pays when the expert tier is big enough to absorb the eviction
+without touching the disk. One card with plenty of RAM: yes. One card whose tier spills to NVMe: no. Two
+cards: the split wins anyway.
+
+The +44% this drafter showed on a deliberately repetitive prompt (98% acceptance, all windows) is an artifact
+of that prompt — on natural text acceptance is 48-75%. And on natural text n-gram drafting barely fires at all
+(1-3 windows per 160 tokens), so `--spec 4` is nearly free and nearly useless for chat.
 
 ## Building the image
 

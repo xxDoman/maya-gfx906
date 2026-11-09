@@ -1,18 +1,35 @@
 {
   "exe": "/opt/strata/engine/strata",
-  "args": ["--glm-pack", "/models/abyss/0731",
-           "--ple-gguf", "/models/abyss/DeepSeek-V4-Flash-0731-UD-IQ3_S-00002-of-00004.gguf",
-           "--max-context", "131072",
-           "--prefill", "auto",
-           "--kv-resident", "20480",
-           "--spec", "1"],
+  "args": [
+    "--glm-pack",
+    "/models/abyss/0731",
+    "--ple-gguf",
+    "/models/abyss/DeepSeek-V4-Flash-0731-UD-IQ3_S-00002-of-00004.gguf",
+    "--max-context",
+    "131072",
+    "--prefill",
+    "auto",
+    "--kv-resident",
+    "20480",
+    "--spec",
+    "1"
+  ],
   "cwd": "/opt/strata",
+  "backend": "hip",
   "tokenizer": "/models/abyss/0731/tokenizer",
   "model_name": "deepseek-v4-flash-0731-iq3s",
-  "sampling": {"temperature": 1.0, "top_p": 0.95},
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
   "port": 8092,
   "log": "/data/maya/logs/abyss-server.log",
-  "env": {"LD_LIBRARY_PATH": "/opt/rocm/lib", "STRATA_GLM_RAM_GB": "100", "STRATA_GLM_TIMING": "1", "STRATA_GLM_RAM_THP": "0"},
+  "env": {
+    "LD_LIBRARY_PATH": "/opt/rocm/lib",
+    "STRATA_GLM_RAM_GB": "100",
+    "STRATA_GLM_TIMING": "1",
+    "STRATA_GLM_RAM_THP": "0"
+  },
   "gpu": "0,1",
   "layer_split": "auto"
 }

@@ -74,6 +74,23 @@ print(" ".join("%s=%s" % (k, v) for k, v in sorted(env.items()) if k.startswith(
 PY
 )"
 
+# Monitor (zakladka Hardware): server czyta karte przez sysfs tylko wtedy, gdy
+# config mowi "backend": "hip". Bez tego klucza zostaje przy NVML, ktorego na
+# AMD nie ma, i pokazuje "–" przy GPU active / VRAM / power / temp / PCIe,
+# choc CPU, RAM i dysk dzialaja. Obraz jest wylacznie AMD (gfx906), wiec
+# dopisujemy brakujacy klucz takze w starych wolumenach.
+python3 - "$CONFIG" <<'PY'
+import json, sys
+path = sys.argv[1]
+cfg = json.load(open(path))
+if not cfg.get("backend"):
+    cfg["backend"] = "hip"
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print('[maya] config bez "backend" — dopisano "hip" (Monitor czyta wtedy sysfs, nie NVML)')
+PY
+
 RAM_TIER=$(python3 - "$CONFIG" <<'PY'
 import json, sys
 cfg = json.load(open(sys.argv[1]))

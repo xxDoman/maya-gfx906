@@ -1,0 +1,32 @@
+{
+  "exe": "/opt/strata/engine/strata",
+  "args": [
+    "--glm-pack",
+    "/models/abyss/0731",
+    "--ple-gguf",
+    "/models/abyss/DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00002-of-00003.gguf",
+    "--max-context",
+    "8192",
+    "--prefill",
+    "auto",
+    "--spec",
+    "4"
+  ],
+  "cwd": "/opt/strata",
+  "tokenizer": "/models/abyss/0731/tokenizer",
+  "model_name": "deepseek-v4-flash-0731",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
+  "port": 8092,
+  "log": "/data/maya/logs/abyss-server.log",
+  "env": {
+    "LD_LIBRARY_PATH": "/opt/rocm/lib",
+    "STRATA_GLM_RAM_GB": "40",
+    "STRATA_GLM_TIMING": "1",
+    "STRATA_GLM_RAM_THP": "0",
+    "STRATA_ROCBLAS_TUNING": "/opt/strata/rocblas-tuning.txt",
+    "STRATA_HIP_PROMPT_F16": "1"
+  }
+}
