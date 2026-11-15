@@ -429,6 +429,26 @@ Step 2 is the part nobody has run against MXFP4 — the pack builder is the same
 pack, and an MXFP4 expert blob is a different type in `native_experts.txt` than it expected. If it refuses,
 the message is the useful part.
 
+**The packer gap, and the one line that closes it (issue #3).** bartowski's MXFP4 shards store
+`blk.N.indexer.proj.weight` as **BF16**; the UD packs store it **F32**. Comparing every one of the 705 in-pack
+(dense) tensors of the two families, this is the *only* type that differs. The packer that shipped in the base
+image did not name the tensor, so the pack carried a kind-4 (BF16) row and the engine stopped at load:
+
+```
+maya generate: deepseek4: unresolved weights: blk.2.indexer.proj.weight (f32) ... blk.20.indexer.proj.weight (f32)
+```
+
+The engine reads those rows as F32 (an F16 source it widens itself, a BF16 one it does not), so the packer has
+to widen them: one entry in `iq_pack.py`'s FORM table
+
+```python
+"indexer.proj.weight": "F32",
+```
+
+produces index kind 2, 1 MiB per layer (21 layers, 22 MB) — lossless, and byte-for-byte the row shape a working
+UD pack carries. `tools/iq_pack.py` in this repo is the base image's packer with that entry added and is copied
+into the image; a pack built with an older packer has to be rebuilt, the engine does not fall back.
+
 ```sh
 # 3. smoke test: the engine straight up, no Maya, one prompt
 docker run --rm -it \

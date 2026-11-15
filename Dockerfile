@@ -66,6 +66,10 @@ COPY --from=build /src/build-gfx906/strata /opt/strata/engine/strata
 COPY --from=build /src/serve /opt/maya/serve
 COPY --from=build /src/tools/strata_tokenizer.py /opt/maya/tools/strata_tokenizer.py
 COPY --from=build /src/tools/gguf_reader.py /opt/maya/tools/gguf_reader.py
+# The packer: the base image's tools/iq_pack.py predates this engine's deepseek4 rules and writes a BF16 row
+# for indexer.proj.weight, which the loader refuses ("unresolved weights: blk.N.indexer.proj.weight (f32)").
+# The vendored copy adds that one FORM entry; see the header of tools/iq_pack.py.
+COPY tools/iq_pack.py /opt/strata/tools/iq_pack.py
 COPY maya/config/strata-dsv4.json /opt/maya/defaults/strata-dsv4.json
 COPY maya/config/strata-dsv4-2x.json /opt/maya/defaults/strata-dsv4-2x.json
 COPY maya/docker-entrypoint.sh /opt/maya/docker-entrypoint.sh
