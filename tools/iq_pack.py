@@ -1,9 +1,14 @@
-# Vendored from xxdoman/strata-mi50:0.2.9 /opt/strata/tools/iq_pack.py with ONE added FORM entry:
-# "indexer.proj.weight": "F32" (see FORM below). bartowski's MXFP4 shards store that tensor BF16 while the
-# UD packs store it F32; without the entry the packer wrote a kind-4 (BF16) row and the engine refused the
-# load with "maya generate: deepseek4: unresolved weights: blk.N.indexer.proj.weight (f32)". The entry makes
-# the packer widen it BF16/F16 -> F32 losslessly, the same row the UD pack carries (index kind 2, 1 MiB/layer).
-# Drop this file and its Dockerfile COPY when the base image ships a packer that already names the tensor.
+# Vendored from zephel01/Abyss at the commit this image's engine is built from (SRC_COMMIT in the
+# Dockerfile, v1.3.116), copied over the base image's tools/iq_pack.py in the final stage.  The base image
+# (xxdoman/strata-mi50:0.2.9) carries an older packer generation, and that mismatch broke two MXFP4 packs:
+#   * it did not name "indexer.proj.weight" in its FORM table, so the BF16 tensor bartowski's MXFP4 shards
+#     carry stayed BF16 and the loader - which reads it F32 - stopped with
+#     "deepseek4: unresolved weights: blk.N.indexer.proj.weight (f32)";
+#   * it wrote the v4 straddle column of native_experts.txt comma-joined (",shardB,shardC,"), while the
+#     engine splits that row on whitespace and needs exactly three names, so the load died with
+#     "pack: unknown shard ,DeepSeek-...-00002-of-00004.gguf,".
+# This is the packer from the same source revision as the engine, so the rows it writes are the rows that
+# engine parses.  Delete this file and its COPY when the base image catches up.
 """tools/iq_pack.py - plan v0.3 P6: a native pack for any of the model files (Q2_0, IQ2_XS, IQ3_XXS).
 
     python tools/iq_pack.py --gguf <model>-00001-of-00002.gguf --out pack/iq3_xxs            (standalone)
@@ -12,45 +17,33 @@
 The i-quant experts cannot be re-expressed in the Q2_0 pack form, so this pack keeps every quantized tensor in
 its GGUF form:
 
-  experts.bin          optional (--experts-bin): per layer, 512 blobs of [gate rows | up rows | down rows], the
-                       raw GGUF slices.  Blob size is per layer (the files mix IQ1_M ... IQ3_S gate/up and Q2_0 /
-                       IQ4_NL down).  experts.bin.src.json says which source it was cut from (the shards' names and
-                       sizes, the hash of native_experts.txt); an experts.bin is reused only when that matches.
-  native_experts.txt   one line per layer: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard];
-                       written last, so a pack without it is not finished
+  experts.bin          per layer, 512 blobs of [gate rows | up rows | down rows], the raw GGUF slices.  Blob
+                       size is per layer (the files mix IQ1_M ... IQ3_S gate/up and Q2_0 / IQ4_NL down).
+  native_experts.txt   one line per layer: layer gu_type d_type offset blob_bytes (gu_type "G,U" when gate and up
+                       differ in type)
   index.txt            the table the engine loads.  Quantized dense tensors, token_embd and output are served
                        natively from the GGUF by the engine (--native): their rows carry shape only.
-  dense.bin            standalone: the BF16/F16/F32 tensors in the form the engine reads them (index kinds 4/5/2;
-                       3 = F32 narrowed to F16 by the loader) - as the GGUF stores them, or converted (FORM below).
-  conversions.json     every tensor that was converted: shard, source/destination type, method, whether it was
-                       exact, the largest absolute error, the source bytes' sha256 (schema 1).
+  dense.bin            standalone: the BF16/F16/F32 tensors exactly as the GGUF stores them (index kinds 4/5/2).
                        With --base: the base (Q2_0) pack's dense.bin, hard-linked - the float tensors are
                        byte-identical in all three model files (checked) - plus extra.bin for tensors that are
                        float here but quantized in the base pack (blk.1.ple_key).
   tokenizer/           exported from the GGUF (tools/strata_tokenizer.py), with the model's chat template.
 
-Split files: every shard of the model is read (<name>-0000N-of-0000M.gguf beside --gguf; a missing shard is an
-error), so the layers may be split anyhow (Swift 1.5's GGUFs put layers 13-47 in shard 2 and the PLE table in
-shard 1).  A layer whose experts are not in shard 1 names its shard in native_experts.txt (v3).  A shard boundary
-may even fall inside a layer (Unsloth's UD-Q4_K_XL: layer 11's down in shard 2, its gate and up in shard 3): that
-layer's shard column is per role, `gate,up,down` (an empty field = the --gguf shard), and only then is the file
-v4, so an older engine refuses it instead of misreading it.  Every other pack stays v3, byte for byte.  Router
-tensors stored as F32 whose values are exactly BF16 (Swift 1.5) are written as BF16, the form the engine's router
-takes (so are the other F32 tensors the engine reads as BF16, when exact); anything else is refused.
+Split files: every shard of the model is read (<name>-0000N-of-0000M.gguf beside --gguf), so the layers may be
+split anyhow (Swift 1.5's GGUFs put layers 13-47 in shard 2 and the PLE table in shard 1).  A layer whose experts
+are not in shard 1 names its shard in native_experts.txt (v3).  Router tensors stored as F32 whose values are
+exactly BF16 (Swift 1.5) are written as BF16, the form the engine's router takes; anything else is refused.
 
 For ordinary quants, --compat-bf16 dequantizes the small projections that the engine reads as BF16, using
 round-to-nearest-even. This introduces BF16 rounding; it does not reconstruct the original full-precision
-weights. Experts, native attention projections, token embeddings, a Q2_0/Q8_0 PLE key and the disk-backed PLE
-table stay unchanged.
+weights. Experts, native attention projections, token embeddings and the disk-backed PLE table stay unchanged.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
@@ -64,65 +57,141 @@ import gguf_reader as G  # noqa: E402
 FLOAT = {"BF16", "F32", "F16"}
 ROUTERS = ("ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight")
 NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read from its GGUF by the engine
+# deepseek41's Engram hash values stored as tensors (ISTA-DASLab's / Strata's layout): write_engram reads them into
+# engram.txt / engram_token_map.u32
+NOT_IN_PACK |= {"engram_primes.weight", "engram_offsets.weight", "engram_multipliers.weight", "engram_token_map.weight"}
+# deepseek41's Engram tables (I8 rows of 264 bytes, 2 x 94 GiB): read row by row from the GGUF by the engine
+NOT_IN_PACK_SUFFIX = ("engram_embd.weight", "exp_probs_b_vl.bias")   # (the _vl bias: image tokens only)
 
-# The float form the engine reads each pack tensor in (name without `blk.N.`; from eddoursul/Strata's FORM table).
-# The residual, router, GDN, QSA and PLE kernels read these small projections as BF16, the norms as F32 and the PLE
-# conv as F16.  GSQ-RCO files already store them that way; other files do not (Unsloth's UD-Q4_K_XL: the routers,
-# SSM gates and injections F32, the hyper-connection projections and the PLE value Q8_0, the PLE conv F32), so a
-# tensor stored otherwise is converted, and every conversion is recorded in conversions.json:
-#   F32 -> BF16 whose values are exactly BF16 (low 16 bits zero)    exact, by default
-#   F32 with other values, F16 or a quantized type -> BF16          rounds (nearest-even): only with --compat-bf16
-#   F32 -> F16 (ple_conv1d)                                         index kind 3, narrowed by the loader (#255),
-#                                                                   by default - the kernel reads nothing else
-#   F16 / BF16 -> F32                                               exact widening, by default
-# Tensors not named here are written as stored (floats) or served from the GGUF (quantized), as before.
-FORM = {
-    "ffn_gate_inp.weight": "BF16", "ffn_gate_inp_shexp.weight": "BF16",
-    "hc_attn_down.weight": "BF16", "hc_attn_up.weight": "BF16", "hc_attn_inject.weight": "BF16",
-    "hc_ffn_down.weight": "BF16", "hc_ffn_up.weight": "BF16", "hc_ffn_inject.weight": "BF16",
-    "output_hc_down.weight": "BF16", "output_hc_up.weight": "BF16",
-    "indexer.k_proj.weight": "BF16", "indexer.q_proj.weight": "BF16",
-    # deepseek4 reads the DSA index projection as F32 and widens an F16 source itself; the UD packs
-    # store it F32, bartowski's MXFP4 stores it BF16, so name it here or the pack keeps the BF16 and
-    # the engine refuses the load with "unresolved weights: blk.N.indexer.proj.weight (f32)"
-    "indexer.proj.weight": "F32",
-    "ssm_alpha.weight": "BF16", "ssm_beta.weight": "BF16",
-    "ple_key.weight": "BF16", "ple_value.weight": "BF16", "ple_conv1d.weight": "F16",
-    "attn_q_norm.weight": "F32", "attn_k_norm.weight": "F32", "hc_attn_norm.weight": "F32",
-    "hc_ffn_norm.weight": "F32", "output_hc_norm.weight": "F32", "indexer.q_norm.weight": "F32",
-    "indexer.k_norm.weight": "F32", "ple_norm_conv.weight": "F32", "ple_norm_key.weight": "F32",
-    "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
-    "ssm_norm.weight": "F32",
-}
-# PLE key encodings left in the GGUF for the engine's native PLE key: the formats NativeDense serves (Q2_0; Q8_0 in
-# UD-Q4_K_XL; IQ3_XXS and IQ4_XS, #381).  Other quantized keys take the BF16 path (--compat-bf16), as before.
-NATIVE_PLE_KEY = {"Q2_0", "Q8_0", "IQ3_XXS", "IQ4_XS"}
-KIND = {"BF16": "4", "F16": "5", "F32": "2"}
+# These small projections are read as BF16 by the residual, router, GDN, QSA and PLE kernels.
+# Strata's Qwen files already store them that way. Ordinary GGUF quants (including OrcaRouter's IQ3_XXS)
+# quantize them too; --compat-bf16 explicitly dequantizes and rounds ONLY these tensors.
+BF16_PROJECTIONS = (
+    "hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+    "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
+    "ssm_alpha.weight", "ssm_beta.weight", "indexer.q_proj.weight", "indexer.k_proj.weight",
+    "ple_value.weight", *ROUTERS,
+)
+BF16_OUTPUT = {"output_hc_down.weight", "output_hc_up.weight"}
+
+# The architectures the packer knows.  The BF16-preserve lists are PER ARCHITECTURE because each
+# engine reads different projections as high-precision: qwen4exp's hyper-connections use the
+# down/up/inject bottleneck names, glm5-next's mHC uses fn/base/scale, and their indexers do not
+# share a single tensor name.
+GLM5NEXT_BF16 = (
+    # the mHC mixes (the released config keeps these unquantized; the runner's glm_hc kernels
+    # consume them per token)
+    "hc_attn_fn.weight", "hc_attn_base.weight", "hc_attn_scale.weight",
+    "hc_ffn_fn.weight", "hc_ffn_base.weight", "hc_ffn_scale.weight",
+    # the indexer - at 1M context the selection IS the model's accuracy
+    "indexer.attn_q_b.weight", "indexer.attn_k.weight", "indexer_compressor_gate.weight",
+    "indexer_compressor_ape.weight", "indexer.proj.weight", "indexer.k_norm.weight",
+    "indexer.k_norm.bias",
+    # the router and its noaux_tc selection bias (F32 by config: moe_router_dtype float32)
+    "ffn_gate_inp.weight", "exp_probs_b.bias",
+    # the KDA gates and norms (gates stay unquantized in the released model); the conv weights
+    # seed the whole KDA recurrence, so their quantization noise would accumulate per token
+    "ssm_a", "ssm_dt.bias", "ssm_norm.weight", "ssm_beta.weight",
+    "ssm_f_a.weight", "ssm_f_b.weight", "ssm_g_a.weight", "ssm_g_b.weight",
+    "ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight",
+    # the MLA norms and the 3-D absorbed projections that form the attention scores and values
+    "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
+    "attn_k_b.weight", "attn_v_b.weight",
+)
+# The ONLY non-expert tensors a glm5-next pack may serve NATIVELY (quantized, read from the
+# GGUF by the Phase-4 driver's native reader): the attention projections and the dense/shared
+# FFN weights, which are exactly what dynamic recipes quantize on a real file.  Everything
+# else quantized fails the pack CLOSED - the packer errors instead of emitting a row the
+# engine would reject at load, far from where the mistake was made.
+GLM5NEXT_NATIVE_OK = (
+    "attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_output.weight",
+    # the KDA layers' separate projections (Q5_K in the UD recipe)
+    "attn_q.weight", "attn_k.weight", "attn_v.weight",
+    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+    # the UD-IQ1_S recipe stores even the embedding and the head at Q4_K; the pack loader
+    # dequantizes them into the F32 arena at load (2x ~1.2 GB quantized)
+    "token_embd.weight", "output.weight",
+)
+# deepseek4 (DeepSeek V4 Flash, docs/deepseek4/SPEC.md): the mHC fn matrices are read as BF16 by the shared hc
+# kernels (the GGUFs store them F32 - --compat-bf16 rounds them, as glm5-next's are); every other float tensor stays as
+# stored (indexer.proj and the compressors' ape/norm are read as F32)
+DEEPSEEK4_BF16 = ("hc_attn_fn.weight", "hc_ffn_fn.weight")
+DEEPSEEK4_BF16_GLOBAL = {"output_hc_fn.weight"}
+# GGUFs that store the small projections as F16 (antirez's deepseek-v4-gguf, huihui-ai's abliterated copies; unsloth's
+# are BF16 / Q8_0 / F32): --compat-bf16 rounds the router and the projections the engine serves by GEMV to BF16, and
+# widens the rows it reads as F32 (indexer.proj, the compressors' ape) to F32 - lossless.  token_embd stays F16 (the
+# engine dequantizes its rows on the host from the shard).
+DEEPSEEK4_F16_TO_BF16 = ("ffn_gate_inp.weight", "attn_compressor_kv.weight", "attn_compressor_gate.weight",
+                         "indexer_compressor_kv.weight", "indexer_compressor_gate.weight", "indexer.attn_q_b.weight")
+DEEPSEEK4_F16_TO_F32 = ("indexer.proj.weight", "attn_compressor_ape.weight", "indexer_compressor_ape.weight")
+DEEPSEEK4_NATIVE_OK = (
+    "attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight", "attn_output_a.weight", "attn_output_b.weight",
+    "attn_compressor_kv.weight", "attn_compressor_gate.weight",
+    "indexer.attn_q_b.weight", "indexer_compressor_kv.weight", "indexer_compressor_gate.weight",
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+    "ffn_gate_tid2eid.weight",            # I32: the hash-routed layers' expert ids, uploaded raw
+    "token_embd.weight", "output.weight",
+)
+# deepseek41 (DeepSeek V4.1 Flash, the antirez/kyuz0 GGUF layout): deepseek4's tensors plus the index keys' projection
+# and the Engram projection / norms, all F16 / F32 in that GGUF
+DEEPSEEK41_F16_TO_BF16 = DEEPSEEK4_F16_TO_BF16 + ("indexer.attn_k.weight", "engram_kv.weight", "engram_wkv.weight")
+# mrfakename's 1017 Q2_K quantizes nearly every matrix: the ones the engine reads as BF16 (the index keys' projection)
+# or F32 (indexer.proj) are dequantized at any type; engram_wkv is served by the quantized GEMV
+DEEPSEEK41_ANY_TO_BF16 = ("indexer.attn_k.weight",)
+DEEPSEEK41_ANY_TO_F32 = ("indexer.proj.weight",)
+DEEPSEEK41_NATIVE_OK = DEEPSEEK4_NATIVE_OK + ("engram_wkv.weight", "engram_kv.weight")
+# qwen35moe (Qwen3.5-MoE: Ornith-1.5-122B): every non-expert tensor is served as stored - the Q8_0 projections by the
+# quantized GEMV, the F32 norms / conv / router / gates / ssm_a as F32 - so nothing is converted; the NextN block
+# (blk.{trunk}) is dropped as glm5-next's
+QWEN35MOE_NATIVE_OK = (
+    "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ssm_alpha.weight", "ssm_beta.weight",
+    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+    "token_embd.weight", "output.weight",
+)
+# qwen4exp for the fast path (--fast): the same, plus the hyper-connections' low-rank projections (Q6_K / Q8_0 as
+# stored) and the PLE key / value
+QWEN4EXP_FAST_NATIVE_OK = QWEN35MOE_NATIVE_OK + (
+    "hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+    "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
+    "output_hc_down.weight", "output_hc_up.weight", "ple_key.weight", "ple_value.weight",
+)
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe")   # unsloth spells glm5-next without the hyphen
 
 
-def form_of(name: str):
-    return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
-
-
-def needs_bf16(name: str, type_name: str) -> bool:
-    """Whether the engine reads `name` as BF16 from the pack (not natively from the GGUF)."""
-    if name == "blk.1.ple_key.weight" and type_name in NATIVE_PLE_KEY:
+def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
+    if arch == "deepseek4":
+        return name in DEEPSEEK4_BF16_GLOBAL or (name.startswith("blk.") and name.endswith(DEEPSEEK4_BF16)) or (
+            type_name == "F16" and name.startswith("blk.") and name.endswith(DEEPSEEK4_F16_TO_BF16))
+    if arch == "deepseek41":
+        return name.startswith("blk.") and (name.endswith(DEEPSEEK4_BF16) or name.endswith(DEEPSEEK41_ANY_TO_BF16) or (
+            type_name == "F16" and name.endswith(DEEPSEEK41_F16_TO_BF16)))
+    if arch in ("glm5-next", "glm5next"):
+        # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
+        # as F32 by config), so ONLY the listed projections take the BF16 path.
+        return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
+    if arch in ("qwen35moe", "qwen4exp-fast"):
         return False
-    return form_of(name) == "BF16"
+    if name in BF16_OUTPUT:
+        return True
+    if not name.startswith("blk."):
+        return False
+    # The existing native PLE key supports Q2_0 only. Other key encodings use the BF16 path.
+    return name.endswith(BF16_PROJECTIONS) or (name == "blk.1.ple_key.weight" and type_name != "Q2_0")
 
 
-def dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
-    """The tensor's values as float32 (float types exactly, quantized ones through gguf-py's dequantizer)."""
-    if type_name == "F32":
-        return raw.view(np.float32)
-    if type_name == "F16":
-        return raw.view(np.float16).astype(np.float32)
-    if type_name == "BF16":
-        return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
-    return quants.dequantize(raw, Q[type_name]).astype(np.float32).reshape(-1)
+def index_shape(shape) -> tuple[int, int]:
+    """The (ne0, ne1) the flat index row records for a tensor of GGUF shape `shape`.
+
+    The engine reads packed tensors by BYTE OFFSET and the kernels by their own geometry, so a
+    3-D tensor (glm5-next's absorbed MLA projections and conv weights) packs as the 2-D view
+    (ne0*ne1, ne2): GGUF lays element (i0, i1, i2) at i0 + ne0*i1 + ne0*ne1*i2, which is exactly
+    row (i0 + ne0*i1) of the flattened view - byte-identical, no repacking."""
+    if len(shape) >= 3:
+        return int(shape[0]) * int(shape[1]), int(shape[2])
+    ne0 = int(shape[0])
+    return ne0, (int(shape[1]) if len(shape) > 1 else 0)
 
 
 def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
@@ -136,22 +205,20 @@ def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
     return quants.quantize(values, Q.BF16).tobytes()
 
 
-def f16_values(values: np.ndarray, name: str) -> np.ndarray:
-    """values -> F16, nearest-even (numpy's conversion, which is the engine loader's f16_from_f32); refuses a value
-    that is not finite or overflows F16."""
+def f32_bytes(raw: np.ndarray, type_name: str) -> bytes:
+    from _paths import add_gguf_py
+    add_gguf_py()
+    from gguf import GGMLQuantizationType as Q, quants
+    values = quants.dequantize(raw, Q[type_name]).astype(np.float32)
     if not np.isfinite(values).all():
-        raise ValueError(f"{name}: cannot convert non-finite weights to F16")
-    with np.errstate(over="ignore"):
-        h = values.astype(np.float16)
-    if not np.isfinite(h).all():
-        raise ValueError(f"{name}: a value is beyond F16's range, which the engine reads it as")
-    return h
+        raise ValueError("cannot widen non-finite weights to F32")
+    return values.tobytes()
 
 
 class Model:
     """All shards of one model: name -> (GGUFFile, TensorInfo, memmap, shard path)."""
 
-    def __init__(self, first: pathlib.Path):
+    def __init__(self, first: pathlib.Path, first_wins: bool = False, extra=()):
         import re
         m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", first.name)
         paths = [first]
@@ -159,59 +226,38 @@ class Model:
             total = int(m.group(2))
             paths = [first.with_name(first.name[:m.start()] + "-%05d-of-%05d.gguf" % (i, total))
                      for i in range(1, total + 1)]
-        missing = [str(p) for p in paths if not p.is_file()]
+        missing = [p for p in paths if not p.is_file()]
+        if missing and extra:   # (--engram: a shard left undownloaded because it holds only the Engram table)
+            print("missing shards skipped, the Engram tables from %s: %s" % (", ".join(map(str, extra)),
+                                                                          ", ".join(p.name for p in missing)))
+            paths = [p for p in paths if p.is_file()]
+            missing = []
+        paths += [pathlib.Path(x) for x in extra]   # (another GGUF read after the shards: a separate Engram file)
+        missing = [str(p) for p in missing + paths if not p.is_file()]
         if missing:
             raise FileNotFoundError("missing model shards (wait for the download): " + ", ".join(missing))
         self.paths = paths
-        self.files = [G.GGUFFile(p) for p in paths]
-        self.sizes = [p.stat().st_size for p in paths]
-        check_split(self.files)
         self.where = {}
-        for p, g in zip(paths, self.files):
+        for p in paths:
+            g = G.GGUFFile(p)
             mm = np.memmap(p, dtype=np.uint8, mode="r")
             for t in g.tensors:
                 size = t.expected_bytes()
                 if size is None or g.data_start + t.offset + size > mm.size:
                     raise ValueError(f"{p.name}: unsupported or truncated tensor {t.name}")
                 if t.name in self.where:
+                    if first_wins:   # (a hybrid: shard 1's copy wins - the engine's lookups scan in shard order too)
+                        self.shadowed = getattr(self, "shadowed", 0) + 1
+                        continue
                     raise ValueError(f"{p.name}: duplicate tensor {t.name}")
                 self.where[t.name] = (g, t, mm, p)
 
     def bytes(self, name) -> np.ndarray:
         g, t, mm, _ = self.where[name]
         return tensor_bytes(mm, g, t)
-
-
-def check_split(files) -> None:
-    """The split keys, as the engine checks them (strata::GgufModel): shard 1 carries the metadata, and every shard
-    declares split.count / split.no (and split.tensors.count) consistently - a shard of another model, or a shard
-    renamed into the family, is refused rather than mixed in."""
-    n = len(files)
-    meta0 = files[0].metadata
-    if n == 1:
-        if int(meta0.get("split.count", 1)) > 1:
-            raise ValueError(f"{files[0].path.name} is shard 1 of {meta0['split.count']}, but its name has no "
-                             "-00001-of-0000N.gguf to find the others by")
-        return
-    if "general.architecture" not in meta0:
-        raise ValueError(f"{files[0].path.name} has no general.architecture; the first shard of a split model "
-                         "carries the metadata")
-    total = meta0.get("split.tensors.count")
-    for i, g in enumerate(files):
-        md = g.metadata
-        if md.get("split.count") != n or md.get("split.no") != i or \
-                (total is not None and md.get("split.tensors.count") != total):
-            raise ValueError(f"{g.path.name} does not declare itself shard {i + 1} of {n} of this model "
-                             "(split.count / split.no / split.tensors.count)")
-    if total is not None and sum(len(g.tensors) for g in files) != total:
-        raise ValueError(f"the {n} shards hold {sum(len(g.tensors) for g in files)} tensors, but "
-                         f"split.tensors.count is {total}")
-
-
 ROLES = ("gate", "up", "down")
 N_EXPERT = 512
 ALIGN = 64
-NVFP4_TAIL = 16          # {s_gate, s_up, s_down, 0} after an NVFP4 expert blob
 
 
 def read_index(path: pathlib.Path):
@@ -234,134 +280,107 @@ def is_expert(name: str) -> bool:
     return name.startswith("blk.") and name.endswith(("_exps.weight",))
 
 
-def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
-    """The pack form of one tensor the engine reads from dense.bin: (kind, stored bytes, destination bytes,
-    record or None), or an error string.  `record` describes a conversion for conversions.json."""
-    form = form_of(name)
-    if form is None or form == type_name:
-        return KIND[type_name], raw.tobytes(), raw.nbytes, None
-    values = dequantize(raw, type_name)
-    rec = {"src_type": type_name, "dst_type": form}
-    if form == "BF16":
-        u = values.view(np.uint32) if type_name == "F32" else None
-        if u is not None and not np.count_nonzero(u & 0xFFFF):
-            if not np.isfinite(values).all():
-                return f"{name} is F32 with non-finite values; refused rather than converted"
-            data = (u >> 16).astype("<u2").tobytes()       # the exact BF16 values
-            rec.update(method="f32->bf16: the values are BF16's (low 16 bits zero)", exact=True, max_abs_err=0.0)
-            return "4", data, len(data), rec
-        if not compat_bf16:
-            what = "F32 with values that are not BF16" if type_name == "F32" else type_name
-            return f"{name} is {what}, but the engine requires BF16; use --compat-bf16 (rounds to nearest-even)"
-        data = bf16_bytes(raw, type_name)
-        got = (np.frombuffer(data, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
-        rec.update(method="dequantize->bf16 round-to-nearest-even (--compat-bf16)" if type_name not in FLOAT else
-                   "%s->bf16 round-to-nearest-even (--compat-bf16)" % type_name.lower())
-        rec.update(exact=bool(np.array_equal(got, values)),
-                   max_abs_err=float(np.max(np.abs(got.astype(np.float64) - values))) if values.size else 0.0)
-        return "4", data, len(data), rec
-    if form == "F16":
-        if type_name != "F32" and not compat_bf16:
-            return f"{name} is {type_name}, but the engine reads F16; use --compat-bf16 (rounds to nearest-even)"
-        h = f16_values(values, name)
-        err = float(np.max(np.abs(h.astype(np.float64) - values))) if values.size else 0.0
-        rec.update(exact=bool(np.array_equal(h.astype(np.float32), values)), max_abs_err=err)
-        if type_name == "F32":
-            # The F32 bytes go into dense.bin as index kind 3 and the loader narrows them to F16 (nearest-even), the
-            # form the PLE conv kernel reads (#255, gopinath87607): 4 B/elem in, 2 B/elem out.
-            rec.update(method="f32->f16 by the loader (index kind 3, round-to-nearest-even)")
-            return "3", raw.tobytes(), raw.nbytes // 2, rec
-        rec.update(method="%s->f16 round-to-nearest-even (--compat-bf16)" % type_name.lower())
-        data = h.astype("<f2").tobytes()
-        return "5", data, len(data), rec
-    # form == "F32"
-    if type_name not in ("F16", "BF16") and not compat_bf16:
-        return f"{name} is {type_name}, but the engine reads F32; use --compat-bf16"
-    data = values.astype("<f4").tobytes()
-    rec.update(method="%s->f32 widening" % type_name.lower(), exact=True, max_abs_err=0.0)
-    return "2", data, len(data), rec
+def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: str = "qwen4exp",
+                     block_count: int | None = None) -> int:
+    """Every non-expert tensor of the model: floats into dense.bin as stored (exact-BF16 F32 routers as BF16),
+    quantized ones native-only.
 
-
-def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
-    """Every non-expert tensor of the model: the floats the engine reads from the pack into dense.bin in the form it
-    reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
-    todo, problems = [], []
-    for name, (g, t, mm, p) in model.where.items():
-        if is_expert(t.name) or t.name in NOT_IN_PACK:
-            continue
-        if len(t.shape) > 2:
-            print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
-            return 1
-        # quantized: served from the GGUF unless the engine reads it from the pack (FORM), which takes
-        # --compat-bf16 to dequantize - except the native PLE key encodings
-        form = form_of(name)
-        native = t.type_name not in FLOAT and (form is None or (
-            name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
-        if t.type_name not in FLOAT and not native and not compat_bf16:
-            problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
-        todo.append((name, g, t, mm, p, native))
-    # refused before anything is written: the previous pack stays as it was
-    if problems:
-        for m in problems[:8]:
-            print(m)
-        if len(problems) > 8:
-            print("... and %d more" % (len(problems) - 8))
-        return 1
+    Fail-closed for glm5-next: a non-expert tensor that is neither float nor on the BF16 upgrade
+    list may only pass if GLM5NEXT_NATIVE_OK names it (the Phase-4 native reader's set); anything
+    else is a hard error.  The NextN/MTP block (blk.{block_count}.*, the runner skips MTP) is
+    dropped from the pack entirely."""
+    dropped = 0
+    if not compat_bf16:
+        for name, (_, t, _, _) in model.where.items():
+            if needs_bf16(name, t.type_name, arch) and t.type_name != "BF16" and not (
+                    t.type_name == "F32" and name.endswith(ROUTERS) and arch == "qwen4exp"):
+                print(f"{name} is {t.type_name}, but the engine requires BF16; use --compat-bf16")
+                return 1
     rows, at = [], 0
     served = 0
-    converted, records = [], []
-    with open(out / "dense.bin.tmp", "wb") as fo:
-        for name, g, t, mm, p, native in todo:
-            ne0 = int(t.shape[0])
-            ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
-            if native:
+    converted = []
+    with open(out / "dense.bin", "wb") as fo:
+        for name, (g, t, mm, _) in model.where.items():
+            if is_expert(t.name) or t.name in NOT_IN_PACK or t.name.endswith(NOT_IN_PACK_SUFFIX):
+                continue
+            if block_count is not None and name.startswith("blk."):
+                il = name.split(".")[1]
+                if il.isdigit() and int(il) >= block_count:
+                    dropped += 1
+                    continue
+            # a trailing ne3 of 1 adds no bytes: some converters write glm5-next's conv weights as
+            # [4, 1, 8192, 1] instead of [4, 1, 8192], and index_shape packs both as (4, 8192)
+            dims = len(t.shape) - (len(t.shape) == 4 and int(t.shape[3]) == 1)
+            if dims == 3 and arch == "deepseek41" and "exps" not in name:
+                # (ISTA-DASLab's GSQ-RCO builds keep the grouped output LoRA as [4096, 1024, 8], unsloth's as
+                # [4096, 8192]: the same bytes - rows of ne0 - so it packs as the 2-D view (ne0, ne1 * ne2))
+                t.shape = [int(t.shape[0]), int(t.shape[1]) * int(t.shape[2])]
+                dims = 2
+            if dims > 2 and not (arch in ("glm5-next", "glm5next") and dims == 3):
+                print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
+                return 1
+            ne0, ne1 = index_shape(t.shape)
+            convert = compat_bf16 and needs_bf16(t.name, t.type_name, arch) and t.type_name != "BF16"
+            widen = (compat_bf16 and arch in ("deepseek4", "deepseek41") and t.type_name in ("F16", "BF16")
+                     and name.startswith("blk.") and name.endswith(DEEPSEEK4_F16_TO_F32))
+            # (BF16 too: bartowski's MXFP4 shards keep indexer.proj in BF16 - exact in F32. Only F16 was
+            # widened here, so an MXFP4 pack kept the BF16 row and the loader refused the model with
+            # "deepseek4: unresolved weights: blk.N.indexer.proj.weight (f32)".)
+            widen_q = (compat_bf16 and arch == "deepseek41" and t.type_name not in ("F32", "F16") and name.startswith("blk.")
+                       and name.endswith(DEEPSEEK41_ANY_TO_F32))
+            if t.type_name in FLOAT or convert or widen_q:
+                raw = tensor_bytes(mm, g, t).tobytes()
+                if widen_q:
+                    raw = f32_bytes(np.frombuffer(raw, dtype=np.uint8), t.type_name)
+                    kind = "2"
+                    converted.append({"name": t.name, "source_type": t.type_name, "bytes": len(raw), "to": "F32"})
+                elif widen:
+                    raw = f32_bytes(np.frombuffer(raw, dtype=np.uint8), t.type_name)
+                    kind = "2"
+                    converted.append({"name": t.name, "source_type": t.type_name, "bytes": len(raw), "to": "F32"})
+                elif convert:
+                    raw = bf16_bytes(np.frombuffer(raw, dtype=np.uint8), t.type_name)
+                    kind = "4"
+                    converted.append({"name": t.name, "source_type": t.type_name, "bytes": len(raw)})
+                else:
+                    kind = {"BF16": "4", "F16": "5", "F32": "2"}[t.type_name]
+                if not convert and arch == "qwen4exp" and t.type_name == "F32" and t.name.endswith(ROUTERS):
+                    u = np.frombuffer(raw, dtype=np.uint32)
+                    if np.count_nonzero(u & 0xFFFF):
+                        print("router %s is F32 with values that are not BF16; the engine's router is BF16" % t.name)
+                        return 1
+                    raw = (u >> 16).astype(np.uint16).tobytes()     # the exact BF16 values
+                    kind = "4"
+                rows.append([t.name, "0", kind, str(at), str(len(raw)), "0", str(len(raw)), str(ne0), str(ne1),
+                             "0", "0", "1"] + ["0"] * 7)
+                fo.write(raw)
+                pad = (-len(raw)) % ALIGN
+                fo.write(b"\0" * pad)
+                at += len(raw) + pad
+            elif arch in ("deepseek4", "deepseek41") and not name.endswith(
+                    DEEPSEEK41_NATIVE_OK if arch == "deepseek41" else DEEPSEEK4_NATIVE_OK):
+                print("%s is %s: not on the BF16 upgrade list nor the deepseek4 native set "
+                      "(DEEPSEEK4_NATIVE_OK); refusing to pack it silently" % (t.name, t.type_name))
+                return 1
+            elif arch in ("glm5-next", "glm5next") and not name.endswith(GLM5NEXT_NATIVE_OK):
+                print("%s is %s: not on the BF16 upgrade list nor the glm5-next native set "
+                      "(GLM5NEXT_NATIVE_OK); refusing to pack it silently" % (t.name, t.type_name))
+                return 1
+            elif arch == "qwen35moe" and not name.endswith(QWEN35MOE_NATIVE_OK):
+                print("%s is %s: not on the qwen35moe native set (QWEN35MOE_NATIVE_OK); refusing to pack it "
+                      "silently" % (t.name, t.type_name))
+                return 1
+            elif arch == "qwen4exp-fast" and not name.endswith(QWEN4EXP_FAST_NATIVE_OK):
+                print("%s is %s: not on the qwen4exp fast-path native set (QWEN4EXP_FAST_NATIVE_OK); refusing to "
+                      "pack it silently" % (t.name, t.type_name))
+                return 1
+            else:
                 served += 1
                 rows.append([t.name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
-                continue
-            raw = tensor_bytes(mm, g, t)
-            try:
-                got = convert(name, t.type_name, raw, compat_bf16)
-            except ValueError as e:
-                got = str(e)
-            if isinstance(got, str):
-                print(got)
-                fo.close()
-                (out / "dense.bin.tmp").unlink(missing_ok=True)
-                return 1
-            kind, data, dst_bytes, rec = got
-            if rec is not None:
-                rec = {"name": name, "shard": p.name, **rec,
-                       "source_sha256": hashlib.sha256(raw.tobytes()).hexdigest()}
-                records.append(rec)
-                if "--compat-bf16" in rec["method"]:          # the rounding the flag allowed
-                    converted.append({"name": name, "source_type": t.type_name, "bytes": len(data)})
-            rows.append([t.name, "0", kind, str(at), str(len(data)), "0", str(dst_bytes), str(ne0), str(ne1),
-                         "0", "0", "1"] + ["0"] * 7)
-            fo.write(data)
-            pad = (-len(data)) % ALIGN
-            fo.write(b"\0" * pad)
-            at += len(data) + pad
-    write_index(out, rows, src, served, 0, publish=False)
-    conv = out / "conversions.json.tmp"
-    conv.write_text(json.dumps({
-        "schema": 1, "tool": "tools/iq_pack.py", "compat_bf16": compat_bf16,
-        "source_shards": [{"name": q.name, "size": s} for q, s in zip(model.paths, model.sizes)],
-        "tensors": records,
-    }, indent=1) + "\n", encoding="utf-8")
-    # published together, and the completion marker (native_experts.txt, written last by main) goes first: a stop
-    # from here on leaves a pack that setup and the engine see as unfinished, never a new dense.bin under an old
-    # index or the reverse
-    (out / "native_experts.txt").unlink(missing_ok=True)
-    (out / "dense.bin.tmp").replace(out / "dense.bin")
-    (out / "index.txt.tmp").replace(out / "index.txt")
-    conv.replace(out / "conversions.json")
-    if records:
-        exact = sum(1 for r in records if r["exact"])
-        print("conversions.json: %d tensors converted to the engine's form (%d exact, %d rounded; max |err| %.3g)"
-              % (len(records), exact, len(records) - exact, max(r["max_abs_err"] for r in records)))
-        for r in records:
-            if r["dst_type"] == "F16":
-                print("narrowed to F16 by the loader: %s (%s, index kind 3)" % (r["name"], r["method"]))
+    if dropped:
+        print("NextN/MTP: dropped %d tensors of blk.%d+ (the runner skips MTP; re-pack when a "
+              "GLM5-Next draft graph exists)" % (dropped, block_count))
+    write_index(out, rows, src, served, 0)
     if compat_bf16:
         (out / "compat-bf16.json").write_text(json.dumps({
             "source": str(src), "rounding": "nearest-even", "tensors": converted,
@@ -371,18 +390,16 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     return 0
 
 
-def write_index(out, rows, src, served, n_extra, publish=True):
+def write_index(out, rows, src, served, n_extra):
     at = 0
     for r in rows:
         r[5] = str(at)
         at += (int(r[6]) + ALIGN - 1) // ALIGN * ALIGN
-    with open(out / "index.txt.tmp", "w", encoding="utf-8", newline="\n") as fo:
+    with open(out / "index.txt", "w", encoding="utf-8", newline="\n") as fo:
         fo.write("# strata pack index v3 -- generated by tools/iq_pack.py (native experts) from %s\n" % src.name)
         fo.write("# align %d pool %d tensors %d\n" % (ALIGN, at, len(rows)))
         for r in rows:
             fo.write(" ".join(r) + "\n")
-    if publish:
-        (out / "index.txt.tmp").replace(out / "index.txt")
     print("index.txt: %d tensors, %d served natively, %d in extra.bin, arena %.2f GiB"
           % (len(rows), served, n_extra, at / 2**30))
 
@@ -437,168 +454,149 @@ def index_from_base(a, src, base, out, g, T, mm) -> int:
     return 0
 
 
-def expert_layout(model: Model, src: pathlib.Path):
-    """The pack's expert table: (layout rows, native_experts.txt text, n_expert, total bytes), or an error string.
-    Each role is resolved by name in whichever shard holds it, and its offset is absolute in THAT shard: two
-    shards do not start their data section at the same byte, so one role's data_start must not be used for
-    another's (per-role data_start as in #255, gopinath87607)."""
-    T = {n: w[1] for n, w in model.where.items()}
-    exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
-    if not exps:
-        return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
-    n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
-    n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
-    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
-        return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
-    layout, lines, offset, n_split = [], [], 0, 0
-    for l in range(n_layers):
-        names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
-        if any(n not in T for n in names):
-            return "layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T))
-        ts = [T[n] for n in names]
-        if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != n_expert for t in ts):
-            return "layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, n_expert)
-        per = [t.expected_bytes() // n_expert for t in ts]
-        if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
-            return "layer %d: gate and up differ in type" % l
-        blob = per[0] + per[1] + per[2]
-        nvfp4 = ts[0].type_name == "NVFP4" or ts[2].type_name == "NVFP4"
-        if nvfp4:
-            # NVFP4 (ModelOpt) carries one F32 weight_scale_2 per expert and projection, which the block format has
-            # no room for. Each blob gets a 16-byte tail {s_gate, s_up, s_down, 0} so every consumer that already
-            # moves whole blobs (the arena, the device cache, the prefill staging, a second GPU) moves the scales
-            # with the weights; the gate/up kernels read it. See tools/nvfp4_convert.py.
-            # a mixed expert (e.g. NVFP4 gate/up + Q8_0 down) has the tail too, with 1.0 for the other projection
-            if any(t.type_name == "NVFP4" and "blk.%d.ffn_%s_exps.scale" % (l, r) not in T for t, r in zip(ts, ROLES)):
-                return "layer %d: NVFP4 experts without their .scale tensors" % l
-            blob += NVFP4_TAIL
-        layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
-        ws = [model.where[n] for n in names]
-        files = ["" if w[3] == src else w[3].name for w in ws]
-        column = files[0] if len(set(files)) == 1 else ",".join(files)
-        n_split += len(set(files)) != 1
-        if nvfp4:   # no GGUF offsets: experts.bin is the only source that carries the scale tails
-            lines.append("%d %d %d %d %d" % (l, ts[0].type_id, ts[2].type_id, offset, blob))
-            offset += blob * n_expert
+def write_vl_bias(out, g, model: Model) -> int:
+    """deepseek41: the router bias of the image rows (blk.N.exp_probs_b_vl.bias, n_expert F32 a layer) as one raw
+    exp_probs_b_vl.f32 (n_layers x n_expert x 4 bytes, layer order; a layer without one - the hash-routed ones, which
+    never use a bias - holds zeros).  The engine reads it for an image request (STRATA_GLM_VL_BIAS names another file).
+    A GGUF without it (the converters that drop it) writes nothing, as before."""
+    import re
+    ids = sorted(int(mo.group(1)) for n in model.where for mo in [re.fullmatch(r"blk\.(\d+)\.exp_probs_b_vl\.bias", n)] if mo)
+    if not ids:
+        return 0
+    n_layers = int(g.metadata.get("deepseek41.block_count", ids[-1] + 1))
+    rows = []
+    ne = None
+    for il in range(n_layers):
+        name = "blk.%d.exp_probs_b_vl.bias" % il
+        if name not in model.where:
+            rows.append(None)
             continue
-        line = "%d %d %d %d %d %d %d %d" % (l, ts[0].type_id, ts[2].type_id, offset, blob,
-                                            *[w[0].data_start + w[1].offset for w in ws])
-        lines.append(line + ("" if not column else " " + column))
-        offset += blob * n_expert
-    if n_split:
-        head = ("# strata native experts v4: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
-                "[shard | gate,up,down] (n_expert %d, total %d; absolute offsets in %s, or in the named shard "
-                "beside it - per role where the column is gate,up,down)\n" % (n_expert, offset, src.name))
-        print("%d layer(s) have their gate/up/down in different shards: native_experts.txt v4, per-role shard "
-              "column for %s" % (n_split, ", ".join(str(l) for l, *_ in layout if "," in lines[l])))
-    else:
-        head = ("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
-                "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
-                % (n_expert, offset, src.name))
-    return layout, head + "".join(line + "\n" for line in lines), n_expert, offset
+        v = np.asarray(model.bytes(name)).view(np.float32)
+        if ne is None:
+            ne = v.size
+        if v.size != ne:
+            print("deepseek41: %s has %d values, not %d" % (name, v.size, ne))
+            return 1
+        rows.append(v)
+    arr = np.stack([r if r is not None else np.zeros(ne, np.float32) for r in rows]).astype("<f4")
+    arr.tofile(out / "exp_probs_b_vl.f32")
+    print("deepseek41: exp_probs_b_vl.f32 (%d layers x %d experts; %d layers carry one)" % (n_layers, ne, len(ids)))
+    return 0
 
 
-NATIVE_HEAD = re.compile(r"^# strata native experts v(\d+):")
-
-
-def native_experts_v5(text: str) -> str:
-    """native_experts.txt as expert_layout writes it (v3, or v4 with per-role shards) -> the same table marked v5
-    (Hadamard-folded experts, hadamard.txt beside it), or an error string naming the version it cannot mark."""
-    head, rest = text.split("\n", 1) if "\n" in text else (text, "")
-    m = NATIVE_HEAD.match(head)
-    if not m or m.group(1) not in ("3", "4"):
-        found = "v" + m.group(1) if m else "without a version header (%r)" % head[:40]
-        return ("cannot mark native_experts.txt %s as v5 for Hadamard-folded experts: only v3 and v4 tables are "
-                "supported" % found)
-    return "# strata native experts v5:" + head[m.end():] + " - v5: Hadamard-folded experts, see hadamard.txt\n" + rest
-
-
-HADAMARD_ROLE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
-
-
-def hadamard_spec(meta: dict, layout, n_embd: int, n_ff: int):
-    """prism.hadamard.* (Agention's APR files: routed experts stored in a block-Hadamard-rotated basis; the runtime
-    must rotate their input activations, see include/strata/kernels/cpu/hadamard.hpp) -> the text of hadamard.txt,
-    None for a model without the metadata, or an error string.  Anything this engine cannot apply is refused: a
-    folded weight it would run unrotated computes plausible garbage."""
-    if "prism.hadamard.version" not in meta:
-        return None
-    if int(meta["prism.hadamard.version"]) != 1:
-        return "unsupported prism.hadamard.version %s" % meta["prism.hadamard.version"]
-    block = int(meta.get("prism.hadamard.block_size", 0))
-    if block <= 1 or block & (block - 1):
-        return "invalid prism.hadamard.block_size %r" % block
-    if meta.get("prism.hadamard.transform") != "normalized-sylvester-walsh-hadamard":
-        return "unsupported prism.hadamard.transform %r" % meta.get("prism.hadamard.transform")
-    if meta.get("prism.hadamard.axis") != "input-last-dimension":
-        return "unsupported prism.hadamard.axis %r" % meta.get("prism.hadamard.axis")
-    mode = meta.get("prism.hadamard.sign_mode")
-    if mode not in ("identity", "explicit"):
-        return "unsupported prism.hadamard.sign_mode %r" % mode
-    if meta.get("prism.hadamard.inverse_weight_names"):
-        return ("prism.hadamard.inverse_weight_names (a rotated token embedding) is not supported by this engine: "
-                "%s" % ", ".join(meta["prism.hadamard.inverse_weight_names"][:4]))
-    names = meta.get("prism.hadamard.weight_names") or []
-    if not names:
-        return "prism.hadamard.weight_names is empty"
-    n_layers = len(layout)
-    roles = [0] * n_layers
-    for name in names:
-        m = HADAMARD_ROLE.match(name)
-        if not m or int(m.group(1)) >= n_layers:
-            return ("prism.hadamard folds %s; this engine applies the activation rotation to the routed experts "
-                    "(blk.N.ffn_{gate,up,down}_exps) only" % name)
-        bit = {"gate": 1, "up": 2, "down": 4}[m.group(2)]
-        if roles[int(m.group(1))] & bit:
-            return "duplicate prism.hadamard weight %s" % name
-        roles[int(m.group(1))] |= bit
-    for l, r in enumerate(roles):
-        if bool(r & 1) != bool(r & 2):
-            return "layer %d: prism.hadamard folds only one of gate/up (they share one input)" % l
-        if r and 42 in (layout[l][1] if r & 3 else -1, layout[l][2] if r & 4 else -1):
-            return "layer %d: a Hadamard-folded Q2_0 expert (the engine's Q2_0 rows cannot rotate)" % l
-    lines = ["# strata hadamard v1: prism.hadamard (normalized-sylvester-walsh-hadamard, input-last-dimension, "
-             "sign_mode %s), written by tools/iq_pack.py" % mode, "block %d" % block]
-    widths = {n_embd for r in roles if r & 3} | {n_ff for r in roles if r & 4}
-    if any(w % block for w in widths):
-        return "prism.hadamard block %d does not divide the expert widths %s" % (block, sorted(widths))
-    if mode == "explicit":
-        sw = [int(w) for w in meta.get("prism.hadamard.sign_widths") or []]
-        sv = [int(v) for v in meta.get("prism.hadamard.sign_values") or []]
-        if not sw or sum(sw) != len(sv) or any(w <= 0 or w % block for w in sw) or len(set(sw)) != len(sw):
-            return "prism.hadamard sign_widths / sign_values are inconsistent"
-        if any(v not in (1, -1) for v in sv):
-            return "prism.hadamard sign values must be +1/-1"
-        at, table = 0, {}
-        for w in sw:
-            table[w] = sv[at:at + w]
-            at += w
-        missing = sorted(widths - set(table))
-        if missing:
-            return "prism.hadamard has no sign vector for width(s) %s" % missing
-        for w in sorted(table):
-            lines.append("signs %d %s" % (w, " ".join(str(v) for v in table[w])))
-    for l, r in enumerate(roles):
-        if r:
-            lines.append("layer %d %d %d %d" % (l, r & 1, (r >> 1) & 1, (r >> 2) & 1))
-    return "\n".join(lines) + "\n"
-
-
-def experts_source(model: Model, text: str, total: int) -> dict:
-    """What experts.bin is cut from: the shards (names and sizes) and the hash of native_experts.txt (every
-    per-role file and offset, the formats and the blob sizes).  A same-size experts.bin of another model or
-    another packing is not this one."""
-    return {"schema": 1,
-            "shards": [{"name": p.name, "size": s} for p, s in zip(model.paths, model.sizes)],
-            "native_experts_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            "bytes": total}
-
-
-def read_json(path: pathlib.Path):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+def write_engram(out, g, model: Model) -> int:
+    """deepseek41: what the engine needs to read the Engram rows from the GGUF (worklog 2026-10-18_deepseek41-spec.md
+    section 3): engram.txt (the row format, each table's absolute offset and row count, the primes and multipliers)
+    and the token map as raw uint32 (engram_token_map.u32; the engine's GGUF reader keeps only an array's first
+    items).  Layouts: ds4's (e4m3 + e8m0 rows of 264 bytes), llama.cpp's converter (Q8_0 rows of 256, a table a layer)
+    and llama.cpp PR 30817's (unsloth: deepseek41.ple.* keys, one per_layer_token_embd table)."""
+    m = g.metadata
+    p = "deepseek41.engram."
+    llama = "deepseek41.block_count" in m
+    if not llama and m.get(p + "encoding") != "e4m3_e8m0_32_row264":
+        print("deepseek41: engram.encoding %r (only e4m3_e8m0_32_row264 is implemented)" % m.get(p + "encoding"))
+        return 1
+    # llama.cpp PR 30817 (unsloth's 1017 GGUFs): the hash keys under deepseek41.ple.*, both tables in one
+    # per_layer_token_embd.weight (the second table's rows after the first's: offsets run on across both)
+    ple = "deepseek41.ple.layers" in m
+    if ple:
+        q = "deepseek41.ple."
+        layers = list(m[q + "layers"])
+        primes, mult = list(m[q + "head_vocab_sizes"]), list(m[q + "layer_multipliers"])
+        tmap = m[p + "token_map"]
+        if int(m.get(q + "heads_per_ngram", 0)) != 8 or int(m.get(q + "ngram_size", 0)) != 4 or \
+                int(m.get("deepseek41.embedding_length_per_layer_input", 0)) != 256:
+            print("deepseek41: ple heads_per_ngram / ngram_size / embedding_length_per_layer_input are not 8 / 4 / 256")
+            return 1
+    else:   # (Project Maya's V4.1 GGUFs name the keys engram.layers / head_dim / pad_token_id)
+        layers = list(m[p + "layer_ids"] if p + "layer_ids" in m else m[p + "layers"])
+        # (ISTA-DASLab's / Strata's layout: the primes, offsets, multipliers and token map as I64 / I32 tensors,
+        # [24, 2] / [24, 2] / [4, 2] - a table's values contiguous - and the head shape under deepseek41.engram_*)
+        def tens(name, dtype):
+            return [int(x) for x in model.bytes(name).view(dtype)] if name in model.where else None
+        primes = list(m[p + "primes"]) if p + "primes" in m else tens("engram_primes.weight", np.int64)
+        mult = list(m[p + "multipliers"]) if p + "multipliers" in m else tens("engram_multipliers.weight", np.int64)
+        tmap = m[p + "token_map"] if p + "token_map" in m else tens("engram_token_map.weight", np.int32)
+        if p + "offsets" not in m and "engram_offsets.weight" in model.where:
+            m = dict(m)
+            m[p + "offsets"] = tens("engram_offsets.weight", np.int64)
+            for k in ("head_count", "key_length", "max_ngram_size", "pad_token_id"):
+                alt = {"head_count": "deepseek41.engram_n_heads", "key_length": "deepseek41.engram_head_dim",
+                       "max_ngram_size": "deepseek41.engram_max_ngram_size",
+                       "pad_token_id": "deepseek41.engram_pad_token_id"}[k]
+                if p + k not in m and alt in m:
+                    m[p + k] = m[alt]
+        if primes is None or mult is None or tmap is None:
+            print("deepseek41: no Engram primes / multipliers / token map in the metadata or as tensors")
+            return 1
+    if len(layers) != 2 or len(primes) != 48 or len(mult) != 8:
+        print("deepseek41: unexpected engram metadata (layers %d, primes %d, multipliers %d)"
+              % (len(layers), len(primes), len(mult)))
+        return 1
+    if llama and not ple and (int(m.get(p + "head_count", 0)) != 8 or
+                              int(m.get(p + "key_length", m.get(p + "head_dim", 0))) != 256 or
+                              int(m.get(p + "max_ngram_size", 0)) != 4):
+        print("deepseek41: engram head_count / key_length / max_ngram_size are not 8 / 256 / 4")
+        return 1
+    base = [0, 0]   # (ple: each table's first row in the one tensor)
+    if llama:
+        offs = list(m["deepseek41.ple.head_offsets" if ple else p + "offsets"])
+        if len(offs) != 48:
+            print("deepseek41: %d Engram head offsets, not 48" % len(offs))
+            return 1
+        run = 0
+        for k in range(2):
+            if not ple:
+                run = 0
+            base[k] = run
+            for c in range(24):
+                if int(offs[24 * k + c]) != run:
+                    print("deepseek41: the Engram head offsets are not the running sum of the primes")
+                    return 1
+                run += int(primes[24 * k + c])
+    fmt, lines = "row264 264", []
+    # the tables as one per_layer_token_embd though the model names a table a layer (another GGUF's copy, --engram):
+    # table k's rows begin after the tables before it
+    one = not ple and llama and "blk.%d.engram_embd.weight" % layers[0] not in model.where and \
+        "per_layer_token_embd.weight" in model.where
+    if one:
+        base = [sum(int(x) for x in primes[:24 * k]) for k in range(2)]
+    for k, il in enumerate(layers):
+        name = "per_layer_token_embd.weight" if ple or one else "blk.%d.engram_embd.weight" % il
+        if name not in model.where:
+            print("deepseek41: %s is missing" % name)
+            return 1
+        gg, t, _, path = model.where[name]
+        need = sum(int(x) for x in primes[24 * k:24 * k + 24])
+        rows = int(t.shape[1]) - base[k]
+        if one:
+            rows = min(rows, need) if k == 0 else rows
+        if llama or t.type_name != "I8":   # any ggml row type (Q8_0 in the PR's converter, Q2_K in mrfakename's Q2_K,
+            # IQ4_NL in unsloth's); the engine decodes with ggml's to_float
+            rb = t.expected_bytes() // max(int(t.shape[1]), 1) if t.expected_bytes() else 0
+            ok = int(t.shape[0]) == 256 and rows >= need and rb > 0 and rb <= 272
+            fmt = "ggml %d %d" % (t.type_id, rb)
+            ok = ok and (llama or rows == int(m[p + "rows"][k]))
+        else:
+            ok = t.type_name == "I8" and int(t.shape[0]) == 264 and rows == need == int(m[p + "rows"][k])
+        if not ok:
+            print("deepseek41: %s is %s %s for %d rows of buckets" % (name, t.type_name, list(t.shape), need))
+            return 1
+        if ple or one:
+            rows = need   # (the first table's rows end where the second's begin)
+        lines.append("table %d %d %d %d %s" % (k, il, gg.data_start + t.offset + base[k] * (rb if ple or one else 0), rows,
+                                               pathlib.Path(path).resolve()))
+    lines.insert(0, "format " + fmt)
+    lines.append("primes " + " ".join(str(int(x)) for x in primes))
+    lines.append("multipliers " + " ".join(str(int(x)) for x in mult))
+    lines.append("pad %d" % int(m[p + ("pad_token_id" if ple or p + "pad_id" not in m else "pad_id")]))
+    lines.append("vocab %d" % len(tmap))
+    (out / "engram.txt").write_text("# deepseek41 Engram: format <name> <row bytes>; table <k> <layer> <abs offset> "
+                                    "<rows> <file>\n" + "\n".join(lines) + "\n", encoding="utf-8")
+    np.asarray(tmap, dtype=np.int64).astype(np.uint32).tofile(out / "engram_token_map.u32")
+    print("deepseek41: engram.txt + engram_token_map.u32 (%d tokens, %s rows); the tables stay in the GGUF"
+          % (len(tmap), fmt))
+    return 0
 
 
 def main() -> int:
@@ -607,16 +605,22 @@ def main() -> int:
     ap.add_argument("--base", help="optional: a Q2_0 canonical pack whose dense.bin holds the shared float tensors")
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-experts", action="store_true", help="rewrite the index only")
+    ap.add_argument("--first-wins", action="store_true",
+                    help="a hybrid shard set: a tensor in several shards is taken from the first (e.g. shard 1 = "
+                         "another file's dense weights, the rest = the experts' GGUF)")
+    ap.add_argument("--engram", help="deepseek41: the GGUF holding the Engram tables when they are not in the shards "
+                                     "(blk.N.engram_embd, or per_layer_token_embd as unsloth's 1017 shards have them)")
     ap.add_argument("--compat-bf16", action="store_true",
                     help="dequantize small non-native projections to BF16 for ordinary Qwen4Exp GGUFs "
                          "(rounds weights; leaves experts and the PLE table unchanged)")
+    ap.add_argument("--fast", action="store_true",
+                    help="qwen4exp: a pack for the fast path (--glm-pack) - nothing converted to BF16")
     ap.add_argument("--experts-bin", action="store_true",
                     help="also write experts.bin (the engine otherwise reads the experts from the GGUF itself)")
     a = ap.parse_args()
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
-    # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery: .absolute(), not
-    # .resolve(), which would follow the link to the blob and lose the -0000N-of-0000M name.
+    # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery.
     src = pathlib.Path(a.gguf).absolute()
     base = pathlib.Path(a.base).resolve() if a.base else None
     out = pathlib.Path(a.out)
@@ -624,169 +628,177 @@ def main() -> int:
 
     g = G.GGUFFile(src)
     mm = np.memmap(src, dtype=np.uint8, mode="r")
-    model = Model(src)
+    arch = str(g.metadata.get("general.architecture", ""))
+    if arch not in ARCHITECTURES:
+        print("general.architecture is %r; the packer knows %s" % (arch, " and ".join(ARCHITECTURES)))
+        return 1
+    if arch == "deepseek4":
+        prefix = "deepseek4."
+        print("deepseek4: packing for the Glm5Model runner's deepseek4 path (quantized dense served natively)")
+    if arch == "deepseek41":
+        prefix = "deepseek41."
+        print("deepseek41: packing for the Glm5Model runner's deepseek4 path, V4.1 layout (the Engram tables stay "
+              "in the GGUF)")
+    if arch in ("glm5-next", "glm5next"):
+        # two spellings in the wild: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
+        # unsloth's "glm5next" - the KV PREFIX follows the same spelling, so it is read per file
+        prefix = "glm5-next." if arch == "glm5-next" else "glm5next."
+        print("%s: packing for the Glm5Model runner (quantized dense served natively; the driver "
+              "gate remains closed until the pack wiring lands - docs/maya/GLM5-FLASH.md §9)" % arch)
+    if arch == "qwen35moe":
+        prefix = "qwen35moe."
+        print("qwen35moe: packing for the Glm5Model runner's qwen35moe path (every dense tensor served as stored)")
+    block_count = None
+    trunk = None
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe"):
+        bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
+        if bc is None:
+            print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
+            return 1
+        block_count = int(bc)
+        # the NextN/MTP layer counts INTO block_count in the wild (unsloth ships 46 with
+        # nextn_predict_layers 1): the servable trunk is what is left after subtracting it
+        nextn = int(g.metadata.get(prefix + "nextn_predict_layers", 0) or 0)
+        trunk = block_count - nextn
+        if trunk < 1:
+            print("%s: block_count %d - nextn %d leaves no trunk" % (arch, block_count, nextn))
+            return 1
+    # deepseek41 with the Engram tables in a GGUF of their own (ISTA-DASLab's GSQ-RCO builds, Strata's layout:
+    # deepseek41.engram.file names it, beside shard 1): --engram, else that file - or any GGUF holding the same tables,
+    # e.g. unsloth's 1017 shard with per_layer_token_embd (the same IQ4_NL bytes: no second 110 GB download)
+    extra = []
+    eng_file = a.engram or (str(src.parent / str(g.metadata["deepseek41.engram.file"]))
+                            if "deepseek41.engram.file" in g.metadata else None)
+    if eng_file:
+        if not pathlib.Path(eng_file).is_file():
+            print("deepseek41: the Engram tables' file %s is missing (download it, or pass --engram <a GGUF with "
+                  "them>)" % eng_file)
+            return 1
+        extra.append(eng_file)
+        print("deepseek41: Engram tables from %s" % eng_file)
+    model = Model(src, first_wins=a.first_wins, extra=extra)
+    if getattr(model, "shadowed", 0):
+        print("first-wins: %d tensors of the later shards shadowed by earlier ones" % model.shadowed)
+    if arch == "deepseek4" and trunk is not None and trunk < block_count and \
+            "blk.%d.hc_attn_fn.weight" % (block_count - 1) in model.where:
+        # antirez's deepseek-v4-gguf (huihui-ai's copies too) says nextn_predict_layers 1 but ships no draft block:
+        # the last block has the hyper-connections a NextN block lacks, so it is a trunk layer
+        print("%s: nextn_predict_layers %d but blk.%d is a trunk layer (no draft block in the file)"
+              % (arch, block_count - trunk, block_count - 1))
+        trunk = block_count
+    if trunk is not None:
+        print("%s: block_count %d -> trunk layers 0..%d" % (arch, block_count, trunk - 1))
+    T = {n: w[1] for n, w in model.where.items()}
     if len(model.paths) > 1:
         print("model shards: " + ", ".join(p.name for p in model.paths))
-    # ---- the expert table first: a model that cannot be packed is refused before any file of the pack changes
-    got = expert_layout(model, src)
-    if isinstance(got, str):
-        print(got)
-        return 1
-    layout, text, n_expert, offset = got
-    if any(t.type_name == "NVFP4" for *_, ts in layout for t in ts):
-        a.experts_bin = True   # the GGUF holds the weights without the scale tails: the engine must read experts.bin
-    # ---- prism.hadamard: rotated experts need hadamard.txt beside native_experts.txt, which becomes v5 so an engine
-    # that cannot rotate refuses the pack (instead of running the folded experts on unrotated activations)
-    t0 = layout[0][5]
-    had = hadamard_spec(g.metadata, layout, int(t0[0].shape[0]), int(t0[2].shape[0]))
-    if isinstance(had, str) and not had.startswith("# strata hadamard"):
-        print("prism.hadamard: " + had)
-        return 1
-    if had is not None:
-        text = native_experts_v5(text)
-        if not text.startswith("# strata native experts v5:"):
-            print("prism.hadamard: " + text)
-            return 1
-        print("prism.hadamard: %d layer(s) of Hadamard-folded experts (block %s, %s signs): hadamard.txt, "
-              "native_experts.txt v5" % (sum(1 for ln in had.splitlines() if ln.startswith("layer ")),
-                                         g.metadata["prism.hadamard.block_size"],
-                                         g.metadata["prism.hadamard.sign_mode"]))
-    path = out / "experts.bin"
-    sidecar = out / "experts.bin.src.json"
-    want = experts_source(model, text, offset)
-    reuse = path.exists() and path.stat().st_size == offset and read_json(sidecar) == want
-
-    def nvfp4_tails(l, ts):
-        """(n_expert, NVFP4_TAIL) bytes {s_gate, s_up, s_down, 0} of a layer with an NVFP4 projection; a projection in
-        another format gets exactly 1.0 (the engine multiplies by the tail unconditionally). None for a bad scale."""
-        s = [np.frombuffer(model.bytes("blk.%d.ffn_%s_exps.scale" % (l, r)).tobytes(), dtype=np.float32)
-             if t.type_name == "NVFP4" else np.ones(n_expert, dtype=np.float32) for t, r in zip(ts, ROLES)]
-        tail = np.zeros((n_expert, NVFP4_TAIL // 4), dtype=np.float32)
-        tail[:, 0], tail[:, 1], tail[:, 2] = s[0], s[1], s[2]
-        if not np.isfinite(tail).all() or (tail[:, :3] <= 0).any():
-            print("layer %d: a non-finite or non-positive NVFP4 scale" % l)
-            return None
-        return tail.view(np.uint8)
-
-    def layer_blobs(l, blob, ts):
-        """(n_expert, blob): gate | up | down [| the NVFP4 scale tail] per expert; None for a bad NVFP4 scale."""
-        parts = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
-        if any(t.type_name == "NVFP4" for t in ts):
-            tail = nvfp4_tails(l, ts)
-            if tail is None:
-                return None
-            parts.append(tail)
-        chunk = np.concatenate(parts, axis=1)
-        assert chunk.shape == (n_expert, blob)
-        return chunk
-
-    if reuse:
-        # the sidecar names the shards by name and size, which a re-quantized or fine-tuned checkpoint of the same
-        # geometry packed into the same folder can share: compare the first and last blobs of the first, middle and
-        # last layers with the GGUF too (six blobs, so an unchanged pack is still reused at once)
-        with open(path, "rb") as f:
-            for l, gt, dt, off, blob, ts in (layout[0], layout[len(layout) // 2], layout[-1]):
-                for e in (0, n_expert - 1):
-                    f.seek(off + e * blob)
-                    want_blob = b"".join(model.bytes(t.name).reshape(n_expert, -1)[e].tobytes() for t in ts)
-                    if any(t.type_name == "NVFP4" for t in ts):
-                        tail = nvfp4_tails(l, ts)
-                        want_blob += tail[e].tobytes() if tail is not None else b""
-                    if f.read(blob) != want_blob:
-                        reuse = False
-        if not reuse:
-            print("%s matches %s but not this GGUF's expert blobs" % (path, sidecar.name))
-    if path.exists() and not reuse and not a.experts_bin:
-        if sidecar.exists():
-            print("%s was cut from another source than this model (%s): the engine would read it instead of "
-                  "the GGUF.  Delete it, or rerun with --experts-bin to rewrite it." % (path, sidecar.name))
-            return 1
-        print("warning: %s has no %s, so nothing says it belongs to this model; the engine reads it instead of "
-              "the GGUF (rerun with --experts-bin to rewrite it)" % (path, sidecar.name))
     if a.base:
         if any(w[3] != src for w in model.where.values() if not w[1].name in NOT_IN_PACK):
             print("--base needs a model whose tensors are all in shard 1")
             return 1
-        (out / "native_experts.txt").unlink(missing_ok=True)
         rc = index_from_base(a, src, base, out, g, {t.name: t for t in g.tensors}, mm)
     else:
-        rc = index_standalone(src, out, model, a.compat_bf16)
+        # --fast (qwen4exp): the fast path's pack - every tensor as the GGUF stores it, the F32 routers too
+        rc = index_standalone(src, out, model, a.compat_bf16, "qwen4exp-fast" if a.fast and arch == "qwen4exp" else arch,
+                              trunk)
     if rc:
         return rc
+    if arch == "deepseek41":
+        rc = write_engram(out, g, model) or write_vl_bias(out, g, model)
+        if rc:
+            return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
-    # ---- the experts.  native_experts.txt is written to a temporary name and renamed only when every layer is
-    # in: a stop part-way (a layer split across shards, #171) left a partial native_experts.txt that the next setup
-    # run took as a finished pack (#172).  It is the pack's completion marker, so it is published last.
-    htmp = out / "hadamard.txt.tmp"
-    if had is not None:
-        htmp.write_text(had, encoding="utf-8", newline="\n")
-        htmp.replace(out / "hadamard.txt")
+    # ---- the experts
+    if trunk is not None:
+        # the trunk only: the NextN/MTP layer ships its own experts (a full extra layer) and the
+        # runner skips MTP - deriving n_layers from the max expert index would pack the NextN
+        # layer as a servable layer the driver must never see
+        n_layers = trunk
+        trunk_experts = [n for n in T if n.endswith("_exps.weight")
+                         and n.startswith("blk.") and 0 <= int(n.split(".")[1]) < trunk]
+        if not trunk_experts:
+            print("%s: no routed experts in the trunk; the pack has nothing to serve" % arch)
+            return 1
+        dropped_experts = sum(1 for n in T if n.startswith("blk.%d." % trunk) and n.endswith("_exps.weight"))
+        if dropped_experts:
+            print("%s: %d NextN expert tensors present (blk.%d.*); the trunk keeps layers 0..%d"
+                  % (arch, dropped_experts, trunk, trunk - 1))
     else:
-        (out / "hadamard.txt").unlink(missing_ok=True)      # a previous Hadamard model's, packed into this folder
-    tmp = out / "native_experts.txt.tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fo:
-        fo.write(text)
-    tmp.replace(out / "native_experts.txt")
+        n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
+    # the MoE layers only: the leading dense blocks ship no router and no experts
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe"):
+        lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
+    else:
+        lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)
+    moe_layers = [l for l in range(n_layers) if l >= lead]
+    first_moe = moe_layers[0]
+    n_expert = int(T["blk.%d.ffn_gate_inp.weight" % first_moe].shape[1])  # router rows = experts kept
+    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in moe_layers):
+        print("the routers disagree on the expert count; a per-layer pruned model cannot be packed")
+        return 1
+    layout, offset = [], 0
+    for l in moe_layers:
+        ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
+        per = [t.expected_bytes() // n_expert for t in ts]
+        # gate and up may differ in type (unsloth's UD-IQ1_S Qwen3.8: IQ2_S gate + IQ2_XXS up in 13 layers): the row's
+        # gu_type field is then "G,U" and the blob [gate | up | down] has each role at its own size.  A layer whose
+        # roles agree writes the one type as before, so every other pack stays byte-identical
+        gt = str(ts[0].type_id) if ts[0].type_id == ts[1].type_id else "%d,%d" % (ts[0].type_id, ts[1].type_id)
+        blob = per[0] + per[1] + per[2]
+        layout.append((l, gt, ts[2].type_id, offset, blob, ts))
+        offset += blob * n_expert
+    with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
+        straddle = any(len({w[3] for w in (model.where[t.name] for t in ts)}) != 1
+                       for _, _, _, _, _, ts in layout)
+        version = "v4" if straddle else "v3"
+        fo.write("# strata native experts %s: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
+                 "[shard | gate_shard up_shard down_shard] "
+                 "(n_expert %d, total %d; absolute offsets in %s, or in the named shard(s) beside it)\n"
+                 % (version, n_expert, offset, src.name))
+        for l, gt, dt, off, blob, ts in layout:
+            ws = [model.where[t.name] for t in ts]
+            shards = [w[3] for w in ws]
+            # each role's offset is absolute in ITS OWN named shard: the data_start of the
+            # file that holds the tensor + the tensor's data-section offset.  (Using the
+            # gate role's file for every role put layer 25's down 7616 bytes low in the
+            # UD-IQ1_S pack: gate/up sat in one shard, down in another.)
+            offs = [w[0].data_start + t.offset for w, t in zip(ws, ts)]
+            if len(set(shards)) == 1:
+                # v3 row: one shard for the whole blob (omitted when it is shard 1)
+                line = "%d %s %d %d %d %d %d %d" % (l, gt, dt, off, blob, *offs)
+                fo.write(line + ("" if shards[0] == src else " " + shards[0].name) + "\n")
+            else:
+                # v4 row: the layer straddles shards (a shard boundary inside a layer); each
+                # role names its own file - shard 1 by name too: the engine splits the row on
+                # whitespace, so an empty name would vanish and shift the others.  The engine
+                # reads every role from its own shard (gate_shard / up_shard / down_shard) and
+                # checks each offset against that shard's directory at load, so gate and up may
+                # sit in different files too (a split by size can cut between them).
+                names = [s.name for s in shards]
+                fo.write("%d %s %d %d %d %d %d %d %s\n"
+                         % (l, gt, dt, off, blob, *offs, " ".join(names)))
     if a.skip_experts or not a.experts_bin:
-        if path.exists() and not a.experts_bin:
+        if (out / "experts.bin").exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)
         return 0
-    if reuse:
-        print("experts.bin was cut from this model's shards (%s); not rewritten" % sidecar.name)
+    path = out / "experts.bin"
+    if path.exists() and path.stat().st_size == offset:
+        print("experts.bin exists with the right size; not rewritten")
         return 0
-    # written under a temporary name and renamed when complete, then the sidecar: an interrupted write leaves no
-    # experts.bin, and an experts.bin without its sidecar is never reused
-    sidecar.unlink(missing_ok=True)
-    part = out / "experts.bin.tmp"
-    progress = out / "experts.bin.tmp.json"
-    # A stop part-way (a kill, a power cut) used to cost the whole write again (40 GB, minutes).  The finished layers are kept:
-    # after every layer the file is flushed to disk and experts.bin.tmp.json says how many layers are in it and which source they were
-    # cut from.  The next run continues at that layer when the source is the same and the last kept layer still matches the GGUF.
-    start = 0
-    if part.exists():
-        done = read_json(progress)
-        k = done.get("layers") if isinstance(done, dict) and done.get("want") == want else None
-        if isinstance(k, int) and 0 < k <= len(layout) and part.stat().st_size >= (layout[k][3] if k < len(layout) else offset):
-            l, gt, dt, off, blob, ts = layout[k - 1]
-            last = layer_blobs(l, blob, ts)
-            if last is not None:
-                with open(part, "rb") as f:
-                    f.seek(off)
-                    kept = f.read(n_expert * blob)
-                if kept == last.tobytes():
-                    start = k
-        if start:
-            print("the earlier packing was interrupted: keeping its first %d of %d layers and continuing with layer %d"
-                  % (start, len(layout), start), flush=True)
-        else:
-            print("the earlier packing was interrupted and cannot be continued: starting it again", flush=True)
-    resume_at = layout[start][3] if start < len(layout) else offset
-    with open(part, "r+b" if start else "wb") as fo:
-        if start:
-            fo.truncate(resume_at)       # whatever followed the last recorded layer is a partial write
-            fo.seek(resume_at)
-        for l, gt, dt, off, blob, ts in layout[start:]:
-            chunk = layer_blobs(l, blob, ts)
-            if chunk is None:
-                return 1
+    with open(path, "wb") as fo:
+        for l, gt, dt, off, blob, ts in layout:
+            parts = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
+            chunk = np.concatenate(parts, axis=1)          # (n_expert, blob): gate | up | down per expert
+            assert chunk.shape == (n_expert, blob)
             fo.write(chunk.tobytes())
-            fo.flush()
-            os.fsync(fo.fileno())
-            note = out / "experts.bin.tmp.json.new"
-            note.write_text(json.dumps({"want": want, "layers": l + 1}), encoding="utf-8")
-            note.replace(progress)
             if l % 8 == 0:
-                print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
+                print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name if ts[0].type_id == ts[1].type_id
+                                                                    else ts[0].type_name + "," + ts[1].type_name,
+                                                                    ts[2].type_name, blob,
                                                                         off / 2**30), flush=True)
-    part.replace(path)
-    progress.unlink(missing_ok=True)
-    side_tmp = out / "experts.bin.src.json.tmp"
-    side_tmp.write_text(json.dumps(want, indent=2) + "\n", encoding="utf-8")
-    side_tmp.replace(sidecar)
-    print("experts.bin: %d layers, %.2f GiB" % (len(layout), offset / 2**30))
+    print("experts.bin: %d layers, %.2f GiB" % (n_layers, offset / 2**30))
     return 0
 
 

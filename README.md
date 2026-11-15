@@ -429,25 +429,27 @@ Step 2 is the part nobody has run against MXFP4 — the pack builder is the same
 pack, and an MXFP4 expert blob is a different type in `native_experts.txt` than it expected. If it refuses,
 the message is the useful part.
 
-**The packer gap, and the one line that closes it (issue #3).** bartowski's MXFP4 shards store
-`blk.N.indexer.proj.weight` as **BF16**; the UD packs store it **F32**. Comparing every one of the 705 in-pack
-(dense) tensors of the two families, this is the *only* type that differs. The packer that shipped in the base
-image did not name the tensor, so the pack carried a kind-4 (BF16) row and the engine stopped at load:
+**The packer had to come from the engine's own source (issue #3).** The base image (`strata-mi50:0.2.9`) ships a
+packer from an older generation than the engine this image compiles from Abyss, and that mismatch broke two MXFP4
+packs in a row:
 
-```
-maya generate: deepseek4: unresolved weights: blk.2.indexer.proj.weight (f32) ... blk.20.indexer.proj.weight (f32)
-```
+- it did not name `blk.N.indexer.proj.weight` as F32, so the BF16 tensor bartowski's shards carry stayed BF16 and
+  the load stopped at `deepseek4: unresolved weights: blk.2.indexer.proj.weight (f32)` (index kind 4 where the
+  loader wants kind 2; the UD packs store that tensor F32, and it is the only one of the 705 in-pack dense
+  tensors whose type differs between the two families). Even the newer packer only widened an **F16** source
+  (`t.type_name == "F16"`), so the vendored copy widens F16 **and** BF16 — both exact;
+- it wrote the `native_experts.txt` v4 straddle column comma-joined (`,shardB,shardC,`). The engine splits that
+  row on whitespace and wants exactly three names, one per role, so a pack whose layers cross a shard boundary
+  died with `pack: unknown shard ,DeepSeek-...-00002-of-00004.gguf,` and then the misleading dense error above.
+  The packer from the engine's commit writes `gate_shard up_shard down_shard`, shard 1 by name too, because an
+  empty field would vanish in a whitespace split.
 
-The engine reads those rows as F32 (an F16 source it widens itself, a BF16 one it does not), so the packer has
-to widen them: one entry in `iq_pack.py`'s FORM table
-
-```python
-"indexer.proj.weight": "F32",
-```
-
-produces index kind 2, 1 MiB per layer (21 layers, 22 MB) — lossless, and byte-for-byte the row shape a working
-UD pack carries. `tools/iq_pack.py` in this repo is the base image's packer with that entry added and is copied
-into the image; a pack built with an older packer has to be rebuilt, the engine does not fall back.
+`tools/iq_pack.py` in this repo is now that packer (Abyss `v1.3.116`, the Dockerfile's `SRC_COMMIT`) with the
+BF16 widening, copied over `/opt/strata/tools/iq_pack.py`. Verified against the pack this engine actually runs:
+built from the same UD-IQ2_XXS shards it produces a byte-identical `index.txt` and an identical
+`native_experts.txt`, and the BF16-to-F32 widening on the MXFP4 bytes of shard 4 (offset 28751871744) is
+bit-identical to a plain widening (1 MiB per layer, 21 layers). A pack built with the older packer has to be
+rebuilt — the engine does not fall back.
 
 ```sh
 # 3. smoke test: the engine straight up, no Maya, one prompt
